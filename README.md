@@ -1,12 +1,13 @@
 # ccfind
 
+Full-text search over all Claude Code conversations.
+
 Interactive **content search over your Claude Code conversation history**.
 
-Claude Code stores every session as a JSONL transcript under
-`~/.claude/projects/`. `ccfind` lets you search what was actually *said* across
-all of them — type a phrase and matching conversations stream in live, with the
-phrase highlighted in context. Press `Enter` on a result to jump straight back
-into that conversation (`cd` into its working directory and `claude --resume`).
+## Why
+
+The built-in `claude --resume` picker only matches on a session's name or first
+prompt — not on what was discussed *inside* it. Even worse, each `pwd` will have different, fragmented list of conversation. Which lead users to struggle to continue their past work.
 
 ## Demo
 
@@ -18,10 +19,19 @@ search> rate limiter
   …the rate-limiter test is flaky under load, digging in…              · ~/code/api-gateway ↳ sub-agent   24-05-28 02:49
 ```
 
-## Why
 
-The built-in `claude --resume` picker only matches on a session's name or first
-prompt — not on what was discussed *inside* it. `ccfind` searches the full
+# How 
+
+Claude Code stores every session as a JSONL transcript under
+`~/.claude/projects/`. `ccfind` lets you search what was actually *said* across
+all of them — type a phrase and matching conversations stream in live, with the
+phrase highlighted in context. Press `Enter` on a result to jump straight back
+into that conversation (`cd` into its working directory and `claude --resume`).
+
+
+
+
+`ccfind` searches the full
 transcript body, so you can find a conversation by something that came up
 halfway through it.
 
