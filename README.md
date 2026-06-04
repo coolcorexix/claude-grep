@@ -1,8 +1,6 @@
 # ccfind
 
-Full-text search over all Claude Code conversations.
-
-Interactive **content search over your Claude Code conversation history**.
+Interactive **full-text search over your Claude Code conversation history**.
 
 ## Why
 
