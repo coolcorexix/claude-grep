@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""ccfind - interactive content search over Claude Code conversation transcripts.
+
+Type a phrase; as you type, matching past conversations stream in with the
+phrase highlighted in context (primary) and their working directory (secondary).
+Press Enter on a result to cd into that directory and `claude --resume` it.
+
+Usage:
+  ccfind                 launch interactive search (fzf)
+  ccfind --backend Q     (internal) emit matching rows for query Q
+  ccfind --preview F Q   (internal) render the preview pane for file F / query Q
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+ROOT = os.path.join(HOME, ".claude", "projects")
+MAX_FILES = 150       # cap candidate files inspected per keystroke
+MAX_RESULTS = 80      # cap rows emitted per keystroke
+CTX_BEFORE = 60
+CTX_AFTER = 140
+
+YELLOW = "\x1b[1;33m"
+DIM = "\x1b[2m"
+BOLD = "\x1b[1m"
+CYAN = "\x1b[36m"
+RESET = "\x1b[0m"
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_WIDTH = None
+
+
+def _vlen(s):
+    return len(ANSI_RE.sub("", s))
+
+
+def _vtrunc(s, n):
+    out, count, i = [], 0, 0
+    while i < len(s) and count < n:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        out.append(s[i])
+        count += 1
+        i += 1
+    return "".join(out)
+
+
+def _term_width():
+    global _WIDTH
+    if _WIDTH is not None:
+        return _WIDTH
+    w = 0
+    try:
+        import fcntl
+        import struct
+        import termios
+        with open("/dev/tty") as tty:
+            _, w, _, _ = struct.unpack(
+                "HHHH", fcntl.ioctl(tty, termios.TIOCGWINSZ, b"\0" * 8))
+    except Exception:
+        w = 0
+    if not w:
+        try:
+            w = int(os.environ.get("COLUMNS", 0))
+        except ValueError:
+            w = 0
+    _WIDTH = w or 100
+    return _WIDTH
+
+
+def fmt_ts(ts):
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        return dt.strftime("%y-%m-%d %H:%M")
+    except Exception:
+        return ts[:16].replace("T", " ")
+
+
+def align_right(left, right):
+    if not right:
+        return left
+    usable = max(24, _term_width() - 3)
+    gap = usable - _vlen(left) - len(right)
+    if gap < 1:
+        left = _vtrunc(left, max(0, usable - len(right) - 2)) + "…" + RESET
+        gap = 1
+    return left + " " * gap + DIM + right + RESET
+
+
+def abbrev(path):
+    if path and path.startswith(HOME):
+        return "~" + path[len(HOME):]
+    return path or "?"
+
+
+def highlight(text, query):
+    return re.sub(re.escape(query),
+                  lambda m: YELLOW + m.group(0) + RESET,
+                  text, flags=re.IGNORECASE)
+
+
+def resumable_session(path):
+    """Map a transcript path to the session id `claude --resume` accepts.
+
+    Sub-agent transcripts live at <project>/<PARENT-UUID>/subagents/agent-*.jsonl
+    and cannot be resumed directly, so resolve them to their parent session.
+    Returns (session_id, is_subagent).
+    """
+    parent_dir = os.path.dirname(path)
+    if os.path.basename(parent_dir) == "subagents":
+        return os.path.basename(os.path.dirname(parent_dir)), True
+    base = os.path.basename(path)
+    return (base[:-6] if base.endswith(".jsonl") else base), False
+
+
+def read_cwd(path):
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(e.get("cwd"), str):
+                    return e["cwd"]
+    except Exception:
+        return None
+    return None
+
+
+def extract_text(entry):
+    """Human-readable text from a transcript entry (prompts, replies, results)."""
+    parts = []
+    msg = entry.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                btype = b.get("type")
+                if btype == "text" and isinstance(b.get("text"), str):
+                    parts.append(b["text"])
+                elif btype == "tool_result":
+                    rc = b.get("content")
+                    if isinstance(rc, str):
+                        parts.append(rc)
+                    elif isinstance(rc, list):
+                        for rb in rc:
+                            if isinstance(rb, dict) and isinstance(rb.get("text"), str):
+                                parts.append(rb["text"])
+    if isinstance(entry.get("summary"), str):
+        parts.append(entry["summary"])
+    return "\n".join(parts)
+
+
+def snippet_around(text, idx, qlen):
+    start = max(0, idx - CTX_BEFORE)
+    end = min(len(text), idx + qlen + CTX_AFTER)
+    s = text[start:end]
+    if start > 0:
+        s = "…" + s
+    if end < len(text):
+        s = s + "…"
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def find_candidates(query):
+    try:
+        out = subprocess.run(
+            ["rg", "-l", "--no-ignore", "--hidden", "--fixed-strings",
+             "--ignore-case", "--", query, ROOT],
+            capture_output=True, text=True, timeout=20)
+    except Exception:
+        return []
+    files = [f for f in out.stdout.splitlines() if f.endswith(".jsonl")]
+    files.sort(key=lambda f: os.path.getmtime(f) if os.path.exists(f) else 0,
+               reverse=True)
+    return files[:MAX_FILES]
+
+
+def first_match(path, query):
+    """Return (cwd, timestamp, snippet) for the first occurrence in a file."""
+    ql = query.lower()
+    cwd = ts = snippet = raw_hit = None
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                if raw_hit is None and ql in line.lower():
+                    raw_hit = line
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if cwd is None and isinstance(entry.get("cwd"), str):
+                    cwd = entry["cwd"]
+                if snippet is None:
+                    txt = extract_text(entry)
+                    if txt:
+                        i = txt.lower().find(ql)
+                        if i != -1:
+                            snippet = snippet_around(txt, i, len(query))
+                            ts = entry.get("timestamp")
+                if snippet is not None and cwd is not None:
+                    break
+    except Exception:
+        return None
+    if snippet is None and raw_hit is not None:
+        seg = raw_hit
+        i = seg.lower().find(ql)
+        seg = seg[max(0, i - 80): i + len(query) + 160]
+        seg = (seg.replace("\\n", " ").replace("\\t", " ")
+               .replace('\\"', '"').replace("\\\\", "\\"))
+        snippet = re.sub(r"\s+", " ", seg).strip()
+    if snippet is None:
+        return None
+    return cwd, ts, snippet
+
+
+def backend(query):
+    if len(query.strip()) < 2:
+        return
+    emitted = 0
+    seen = set()
+    for path in find_candidates(query):
+        sid, is_sub = resumable_session(path)
+        if sid in seen:
+            continue
+        r = first_match(path, query)
+        if not r:
+            continue
+        seen.add(sid)
+        cwd, ts, snippet = r
+        tag = " ↳ sub-agent" if is_sub else ""
+        left = (highlight(snippet, query) + "  "
+                + DIM + "· " + abbrev(cwd) + tag + RESET)
+        left = left.replace("\t", " ").replace("\n", " ")
+        disp = align_right(left, fmt_ts(ts))
+        cwd_f = (cwd or "").replace("\t", " ")
+        ts_f = (ts or "").replace("\t", " ")
+        sys.stdout.write(f"{path}\t{cwd_f}\t{ts_f}\t{disp}\n")
+        emitted += 1
+        if emitted >= MAX_RESULTS:
+            break
+
+
+def preview(path, query):
+    sid, is_sub = resumable_session(path)
+    cwd = ts = snippet = None
+    if query:
+        r = first_match(path, query)
+        if r:
+            cwd, ts, snippet = r
+    print(BOLD + "Session  " + RESET + CYAN + sid + RESET
+          + (DIM + "  (resumable parent)" + RESET if is_sub else ""))
+    if is_sub:
+        print(BOLD + "Match in " + RESET + DIM + os.path.basename(path)
+              + " (sub-agent)" + RESET)
+    print(BOLD + "Dir      " + RESET + abbrev(cwd))
+    if ts:
+        print(BOLD + "Time     " + RESET + ts)
+    print()
+    if snippet:
+        print(highlight(snippet, query))
+
+
+def launch():
+    self = os.path.abspath(__file__)
+    me = shlex.quote(self)
+    backend_cmd = f"{me} --backend {{q}}"
+    preview_cmd = f"{me} --preview {{1}} {{q}}"
+    cmd = [
+        "fzf",
+        "--ansi", "--disabled",
+        "--delimiter", "\t",
+        "--with-nth", "4",
+        "--layout", "reverse",
+        "--info", "inline",
+        "--prompt", "search> ",
+        "--header", "type to search your Claude conversations · enter = resume · esc = quit",
+        "--bind", f"start:reload({backend_cmd})",
+        "--bind", f"change:reload({backend_cmd})",
+        "--preview", preview_cmd,
+        "--preview-window", "down,45%,wrap,border-top",
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        sys.exit("ccfind: fzf not found (brew install fzf)")
+    line = (res.stdout or "").strip()
+    if res.returncode != 0 or not line:
+        return
+    fields = line.split("\t")
+    if len(fields) < 2:
+        return
+    path, cwd = fields[0], fields[1]
+    sid, is_sub = resumable_session(path)
+    if is_sub:
+        project_dir = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+        parent_cwd = read_cwd(os.path.join(project_dir, sid + ".jsonl"))
+        if parent_cwd:
+            cwd = parent_cwd
+    if cwd and os.path.isdir(cwd):
+        os.chdir(cwd)
+    elif cwd:
+        sys.stderr.write(f"ccfind: original dir missing ({cwd}); resuming from here\n")
+    os.execvp("claude", ["claude", "--resume", sid])
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        launch()
+    elif args[0] == "--backend":
+        backend(args[1] if len(args) > 1 else "")
+    elif args[0] == "--preview":
+        preview(args[1] if len(args) > 1 else "",
+                args[2] if len(args) > 2 else "")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()
