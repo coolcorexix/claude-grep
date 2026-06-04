@@ -8,6 +8,10 @@ all of them — type a phrase and matching conversations stream in live, with th
 phrase highlighted in context. Press `Enter` on a result to jump straight back
 into that conversation (`cd` into its working directory and `claude --resume`).
 
+## Demo
+
+![ccfind — live content search over your Claude Code conversation transcripts](demo.png)
+
 ```
 search> rate limiter
   …let's add a token-bucket rate limiter in front of the API gateway…   · ~/code/api-gateway   24-05-30 07:59
