@@ -17,6 +17,16 @@
 
 ## Install
 
+### Homebrew (recommended)
+
+```sh
+brew install coolcorexix/tap/claude-grep
+```
+
+Then run `ccfind`. (You'll also need Anthropic's `claude` CLI on your `PATH`.)
+
+### Manual
+
 Requirements: [`fzf`](https://github.com/junegunn/fzf) ≥ 0.38, [`ripgrep`](https://github.com/BurntSushi/ripgrep), Python 3.8+, and the `claude` CLI on your `PATH`.
 
 ```sh
