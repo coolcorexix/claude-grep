@@ -1,8 +1,8 @@
 # claude-grep
 
-> **Full-text search over your Claude Code conversation history** — find any past session by what was *said*, then jump straight back into it. `grep` + `fzf` for everything Claude Code has ever told you.
+> **Search your Claude Code conversation history** — find any past session by what was *said*, then jump straight back into it. `grep` + `fzf` for everything Claude Code has ever told you.
 
-`claude-grep` is a tiny CLI (run with the `ccfind` command) that searches the full text of every Claude Code conversation stored under `~/.claude/projects/`, and lets you resume any of them with a single keypress.
+`claude-grep` is a tiny CLI (run with the `ccfind` command) that searches the text of every Claude Code conversation stored under `~/.claude/projects/`, and lets you resume any of them with a single keypress.
 
 ## Demo
 
@@ -59,7 +59,7 @@ ccfind
 ## FAQ
 
 **How do I search my Claude Code conversation history?**
-Run `claude-grep` (the `ccfind` command) and type any phrase. It runs a live full-text search across every transcript in `~/.claude/projects/` and lets you resume the matching session.
+Run `claude-grep` (the `ccfind` command) and type any phrase. It searches across every transcript in `~/.claude/projects/` and lets you resume the matching session.
 
 **Can I search past Claude Code sessions by content instead of just the title?**
 Yes — that's the whole point. `claude --resume` only matches the session title / first prompt; `claude-grep` searches the entire transcript body.
