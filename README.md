@@ -47,7 +47,7 @@ On macOS: `brew install fzf ripgrep`
 ## Install
 
 ```sh
-git clone https://github.com/<you>/ccfind.git
+git clone https://github.com/coolcorexix/claude-grep
 ln -sf "$PWD/ccfind/ccfind" ~/.local/bin/ccfind   # make sure ~/.local/bin is on PATH
 ```
 
