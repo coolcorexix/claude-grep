@@ -25,6 +25,14 @@ brew install coolcorexix/tap/claude-grep
 
 Then run `ccfind`. (You'll also need Anthropic's `claude` CLI on your `PATH`.)
 
+### Nix
+
+```sh
+nix run github:coolcorexix/claude-grep
+```
+
+Or `nix profile install github:coolcorexix/claude-grep`, or add it to your flake. (`fzf`, `ripgrep`, and Python are bundled in.)
+
 ### Manual
 
 Requirements: [`fzf`](https://github.com/junegunn/fzf) ≥ 0.38, [`ripgrep`](https://github.com/BurntSushi/ripgrep), Python 3.8+, and the `claude` CLI on your `PATH`.
