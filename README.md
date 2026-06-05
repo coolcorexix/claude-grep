@@ -80,23 +80,6 @@ ccfind --source claude         # search only one
 ccfind --source claude,hermes  # or a subset
 ```
 
-## Branch any session at any message (prompt tree)
-
-Like `git checkout` from a commit — but for AI conversations. In the search UI, hit **`Ctrl-B`** instead of `Enter` on any row to:
-
-1. open a picker of all user messages in that session,
-2. pick one as your **checkpoint**,
-3. `ccfind` creates a new Claude Code session with the conversation rewound to that point — and resumes you into it.
-
-The forked session is a first-class Claude session (works with `claude --resume`, appears in your history) and is tagged with the same `forkedFrom: {sessionId, messageUuid}` metadata that Claude's own `/btw` command writes — fully compatible with Claude's native fork format.
-
-Useful when:
-- you went down a wrong rabbit hole and want to try a different direction from a specific message,
-- a session covered multiple tickets and you want each one as its own clean thread,
-- you want to keep the original session intact while exploring an alternative path.
-
-> MVP supports Claude Code only; OpenCode and Hermes branching coming next.
-
 ## FAQ
 
 **How do I search my Claude Code conversation history?**
