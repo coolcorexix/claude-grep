@@ -729,7 +729,7 @@ def launch(enabled=None):
     if enabled:
         detected = [n for n in detected if n in enabled]
     header = ("agents: " + (", ".join(detected) if detected else "none detected")
-              + " · enter resume · ctrl-b branch · esc quit")
+              + "\nEnter resume  ·  " + YELLOW + "Ctrl-B branch" + RESET + "  ·  Esc quit")
     cmd = [
         "fzf",
         "--ansi", "--disabled",
