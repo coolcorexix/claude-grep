@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""ccfind - interactive content search over Claude Code conversation transcripts.
+"""ccfind - interactive content search across your agent conversation histories.
 
-Type a phrase; as you type, matching past conversations stream in with the
-phrase highlighted in context (primary) and their working directory (secondary).
-Press Enter on a result to cd into that directory and `claude --resume` it.
+Searches Claude Code, OpenCode, and Hermes from one UI. Type a phrase; jump back
+into any past session with a single keypress. Each row is tagged with the agent
+it came from ([c] Claude / [h] Hermes / [o] OpenCode).
 
 Usage:
-  ccfind                 launch interactive search (fzf)
-  ccfind --backend Q     (internal) emit matching rows for query Q
-  ccfind --preview F Q   (internal) render the preview pane for file F / query Q
+  ccfind                      launch interactive search across all detected agents
+  ccfind --source claude,hermes
+                              limit to specific agents (comma-separated)
+  ccfind --sources            list which agents are detected on this machine
+  ccfind --backend Q          (internal) emit matching rows for query Q
+  ccfind --preview F Q        (internal) render the preview pane
 """
 import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
-ROOT = os.path.join(HOME, ".claude", "projects")
-MAX_FILES = 150       # cap candidate files inspected per keystroke
-MAX_RESULTS = 80      # cap rows emitted per keystroke
+MAX_FILES = 150
+MAX_RESULTS = 80
 CTX_BEFORE = 60
 CTX_AFTER = 140
 
@@ -30,6 +33,17 @@ DIM = "\x1b[2m"
 BOLD = "\x1b[1m"
 CYAN = "\x1b[36m"
 RESET = "\x1b[0m"
+
+# Source badges (256-color, distinct per agent)
+BADGES = {
+    "claude":   "\x1b[38;5;87m[c]\x1b[0m",
+    "hermes":   "\x1b[38;5;213m[h]\x1b[0m",
+    "opencode": "\x1b[38;5;215m[o]\x1b[0m",
+}
+
+CLAUDE_ROOT = os.path.join(HOME, ".claude", "projects")
+HERMES_ROOT = os.path.join(HOME, ".hermes")
+OPENCODE_DB = os.path.join(HOME, ".local", "share", "opencode", "opencode.db")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _WIDTH = None
@@ -77,13 +91,43 @@ def _term_width():
 
 
 def fmt_ts(ts):
-    if not ts:
+    if ts is None or ts == "":
         return ""
     try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        if isinstance(ts, (int, float)):
+            t = ts / 1000.0 if ts > 1e12 else float(ts)
+            dt = datetime.fromtimestamp(t).astimezone()
+        else:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone()
         return dt.strftime("%y-%m-%d %H:%M")
     except Exception:
-        return ts[:16].replace("T", " ")
+        return str(ts)[:16].replace("T", " ")
+
+
+def ts_key(ts):
+    """Float epoch for sorting; 0 if unparseable."""
+    if ts is None or ts == "":
+        return 0.0
+    if isinstance(ts, (int, float)):
+        return ts / 1000.0 if ts > 1e12 else float(ts)
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def abbrev(path):
+    if path and path.startswith(HOME):
+        return "~" + path[len(HOME):]
+    return path or "?"
+
+
+def highlight(text, q):
+    if not q:
+        return text
+    return re.sub(re.escape(q),
+                  lambda m: YELLOW + m.group(0) + RESET,
+                  text, flags=re.IGNORECASE)
 
 
 def align_right(left, right):
@@ -97,25 +141,72 @@ def align_right(left, right):
     return left + " " * gap + DIM + right + RESET
 
 
-def abbrev(path):
-    if path and path.startswith(HOME):
-        return "~" + path[len(HOME):]
-    return path or "?"
+def snippet_around(text, q, idx):
+    qlen = len(q)
+    s = max(0, idx - CTX_BEFORE)
+    e = min(len(text), idx + qlen + CTX_AFTER)
+    out = text[s:e]
+    if s > 0:
+        out = "…" + out
+    if e < len(text):
+        out = out + "…"
+    return re.sub(r"\s+", " ", out).strip()
 
 
-def highlight(text, query):
-    return re.sub(re.escape(query),
-                  lambda m: YELLOW + m.group(0) + RESET,
-                  text, flags=re.IGNORECASE)
+def first_text_match(text, q):
+    if not text or not q:
+        return None
+    i = text.lower().find(q.lower())
+    if i == -1:
+        return None
+    return snippet_around(text, q, i)
 
 
-def resumable_session(path):
-    """Map a transcript path to the session id `claude --resume` accepts.
+def raw_snippet(raw, q):
+    i = raw.lower().find(q.lower())
+    if i == -1:
+        return None
+    seg = raw[max(0, i - 80): i + len(q) + 160]
+    seg = (seg.replace("\\n", " ").replace("\\t", " ")
+              .replace('\\"', '"').replace("\\\\", "\\"))
+    return re.sub(r"\s+", " ", seg).strip()
 
-    Sub-agent transcripts live at <project>/<PARENT-UUID>/subagents/agent-*.jsonl
-    and cannot be resumed directly, so resolve them to their parent session.
-    Returns (session_id, is_subagent).
-    """
+
+# =====================
+# CLAUDE adapter
+# =====================
+def claude_available():
+    return os.path.isdir(CLAUDE_ROOT)
+
+
+def _claude_extract_text(entry):
+    parts = []
+    msg = entry.get("message")
+    if isinstance(msg, dict):
+        c = msg.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                t = b.get("type")
+                if t == "text" and isinstance(b.get("text"), str):
+                    parts.append(b["text"])
+                elif t == "tool_result":
+                    rc = b.get("content")
+                    if isinstance(rc, str):
+                        parts.append(rc)
+                    elif isinstance(rc, list):
+                        for rb in rc:
+                            if isinstance(rb, dict) and isinstance(rb.get("text"), str):
+                                parts.append(rb["text"])
+    if isinstance(entry.get("summary"), str):
+        parts.append(entry["summary"])
+    return "\n".join(parts)
+
+
+def claude_resumable(path):
     parent_dir = os.path.dirname(path)
     if os.path.basename(parent_dir) == "subagents":
         return os.path.basename(os.path.dirname(parent_dir)), True
@@ -123,7 +214,7 @@ def resumable_session(path):
     return (base[:-6] if base.endswith(".jsonl") else base), False
 
 
-def read_cwd(path):
+def _claude_read_cwd(path):
     try:
         with open(path, "r", errors="replace") as fh:
             for line in fh:
@@ -138,152 +229,405 @@ def read_cwd(path):
     return None
 
 
-def extract_text(entry):
-    """Human-readable text from a transcript entry (prompts, replies, results)."""
-    parts = []
-    msg = entry.get("message")
-    if isinstance(msg, dict):
-        content = msg.get("content")
-        if isinstance(content, str):
-            parts.append(content)
-        elif isinstance(content, list):
-            for b in content:
-                if not isinstance(b, dict):
-                    continue
-                btype = b.get("type")
-                if btype == "text" and isinstance(b.get("text"), str):
-                    parts.append(b["text"])
-                elif btype == "tool_result":
-                    rc = b.get("content")
-                    if isinstance(rc, str):
-                        parts.append(rc)
-                    elif isinstance(rc, list):
-                        for rb in rc:
-                            if isinstance(rb, dict) and isinstance(rb.get("text"), str):
-                                parts.append(rb["text"])
-    if isinstance(entry.get("summary"), str):
-        parts.append(entry["summary"])
-    return "\n".join(parts)
-
-
-def snippet_around(text, idx, qlen):
-    start = max(0, idx - CTX_BEFORE)
-    end = min(len(text), idx + qlen + CTX_AFTER)
-    s = text[start:end]
-    if start > 0:
-        s = "…" + s
-    if end < len(text):
-        s = s + "…"
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def find_candidates(query):
+def claude_find(query):
+    if not claude_available():
+        return []
     try:
         out = subprocess.run(
             ["rg", "-l", "--no-ignore", "--hidden", "--fixed-strings",
-             "--ignore-case", "--", query, ROOT],
+             "--ignore-case", "--", query, CLAUDE_ROOT],
             capture_output=True, text=True, timeout=20)
+        paths = [p for p in out.stdout.splitlines() if p.endswith(".jsonl")]
     except Exception:
         return []
-    files = [f for f in out.stdout.splitlines() if f.endswith(".jsonl")]
-    files.sort(key=lambda f: os.path.getmtime(f) if os.path.exists(f) else 0,
+    paths.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
                reverse=True)
-    return files[:MAX_FILES]
-
-
-def first_match(path, query):
-    """Return (cwd, timestamp, snippet) for the first occurrence in a file."""
+    paths = paths[:MAX_FILES]
     ql = query.lower()
-    cwd = ts = snippet = raw_hit = None
+    results = []
+    for path in paths:
+        cwd = ts = snippet = raw_hit = None
+        try:
+            with open(path, "r", errors="replace") as fh:
+                for line in fh:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    if raw_hit is None and ql in line.lower():
+                        raw_hit = line
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    if cwd is None and isinstance(entry.get("cwd"), str):
+                        cwd = entry["cwd"]
+                    if snippet is None:
+                        txt = _claude_extract_text(entry)
+                        if txt:
+                            s = first_text_match(txt, query)
+                            if s:
+                                snippet = s
+                                ts = entry.get("timestamp") or ts
+                    if snippet and cwd:
+                        break
+        except Exception:
+            continue
+        if snippet is None and raw_hit is not None:
+            snippet = raw_snippet(raw_hit, query)
+        if snippet is None:
+            continue
+        sid, is_sub = claude_resumable(path)
+        results.append({
+            "source": "claude", "sid": sid, "is_sub": is_sub,
+            "cwd": cwd, "ts": ts, "snippet": snippet, "row_path": path,
+        })
+    return results
+
+
+def claude_resume_argv(row):
+    sid = row["sid"]
+    cwd = row.get("cwd")
+    if row.get("is_sub"):
+        path = row.get("row_path") or ""
+        proj_dir = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+        parent_file = os.path.join(proj_dir, sid + ".jsonl")
+        pcwd = _claude_read_cwd(parent_file)
+        if pcwd:
+            cwd = pcwd
+    return cwd, ["claude", "--resume", sid]
+
+
+# =====================
+# HERMES adapter
+# =====================
+def hermes_available():
+    return os.path.isdir(HERMES_ROOT) and (
+        os.path.isdir(os.path.join(HERMES_ROOT, "sessions")) or
+        os.path.isdir(os.path.join(HERMES_ROOT, "profiles")))
+
+
+def hermes_sid_from_path(path):
+    base = os.path.basename(path)
+    for ext in (".jsonl", ".json"):
+        if base.endswith(ext):
+            base = base[:-len(ext)]
+            break
+    if base.startswith("session_"):
+        base = base[len("session_"):]
+    return base
+
+
+def _hermes_text_from_json(d):
+    parts = []
+    for m in d.get("messages", []) or []:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                    parts.append(b["text"])
+                elif isinstance(b, str):
+                    parts.append(b)
+    if isinstance(d.get("title"), str):
+        parts.append(d["title"])
+    return "\n".join(parts)
+
+
+def hermes_find(query):
+    if not hermes_available():
+        return []
     try:
-        with open(path, "r", errors="replace") as fh:
-            for line in fh:
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                if raw_hit is None and ql in line.lower():
-                    raw_hit = line
-                try:
-                    entry = json.loads(line)
-                except Exception:
-                    continue
-                if cwd is None and isinstance(entry.get("cwd"), str):
-                    cwd = entry["cwd"]
-                if snippet is None:
-                    txt = extract_text(entry)
-                    if txt:
-                        i = txt.lower().find(ql)
-                        if i != -1:
-                            snippet = snippet_around(txt, i, len(query))
-                            ts = entry.get("timestamp")
-                if snippet is not None and cwd is not None:
-                    break
+        out = subprocess.run(
+            ["rg", "-l", "--no-ignore", "--hidden", "--fixed-strings",
+             "--ignore-case", "--glob", "*.json", "--glob", "*.jsonl",
+             "--", query, HERMES_ROOT],
+            capture_output=True, text=True, timeout=20)
+        paths = [p for p in out.stdout.splitlines()
+                 if p.endswith((".json", ".jsonl"))]
     except Exception:
-        return None
-    if snippet is None and raw_hit is not None:
-        seg = raw_hit
-        i = seg.lower().find(ql)
-        seg = seg[max(0, i - 80): i + len(query) + 160]
-        seg = (seg.replace("\\n", " ").replace("\\t", " ")
-               .replace('\\"', '"').replace("\\\\", "\\"))
-        snippet = re.sub(r"\s+", " ", seg).strip()
-    if snippet is None:
-        return None
-    return cwd, ts, snippet
+        return []
+    paths = [p for p in paths if "/sessions/" in p or p.endswith("/sessions.json")]
+    paths.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+               reverse=True)
+    paths = paths[:MAX_FILES]
+    results = []
+    for path in paths:
+        sid = hermes_sid_from_path(path)
+        ts = snippet = None
+        try:
+            if path.endswith(".jsonl"):
+                texts = []
+                with open(path, "r", errors="replace") as fh:
+                    for line in fh:
+                        try:
+                            e = json.loads(line)
+                        except Exception:
+                            continue
+                        c = e.get("content")
+                        if isinstance(c, str):
+                            texts.append(c)
+                        elif isinstance(c, list):
+                            for b in c:
+                                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                                    texts.append(b["text"])
+                        if ts is None and e.get("timestamp"):
+                            ts = e["timestamp"]
+                snippet = first_text_match("\n".join(texts), query)
+            else:
+                with open(path, "r", errors="replace") as fh:
+                    try:
+                        d = json.load(fh)
+                    except Exception:
+                        d = None
+                if isinstance(d, dict):
+                    if d.get("session_id"):
+                        sid = d["session_id"]
+                    ts = d.get("last_updated") or d.get("session_start")
+                    snippet = first_text_match(_hermes_text_from_json(d), query)
+        except Exception:
+            continue
+        if snippet is None:
+            try:
+                with open(path, "r", errors="replace") as fh:
+                    snippet = raw_snippet(fh.read(), query)
+            except Exception:
+                snippet = None
+        if snippet is None:
+            continue
+        cwd_hint = None
+        m = re.search(r"/profiles/([^/]+)/", path)
+        if m:
+            cwd_hint = "profile:" + m.group(1)
+        results.append({
+            "source": "hermes", "sid": sid, "is_sub": False,
+            "cwd": cwd_hint, "ts": ts, "snippet": snippet, "row_path": path,
+        })
+    return results
 
 
-def backend(query):
-    if len(query.strip()) < 2:
-        return
-    emitted = 0
+def hermes_resume_argv(row):
+    return None, ["hermes", "--resume", row["sid"]]
+
+
+# =====================
+# OPENCODE adapter
+# =====================
+def opencode_available():
+    return os.path.isfile(OPENCODE_DB)
+
+
+def _opencode_text(data_str):
+    try:
+        d = json.loads(data_str)
+    except Exception:
+        return data_str
+    if not isinstance(d, dict):
+        return data_str
+    parts = []
+    t = d.get("type")
+    if t == "text" and isinstance(d.get("text"), str):
+        parts.append(d["text"])
+    elif t == "tool":
+        for k in ("input", "output", "content"):
+            v = d.get(k)
+            if isinstance(v, str):
+                parts.append(v)
+            elif isinstance(v, dict):
+                parts.append(json.dumps(v))
+    else:
+        c = d.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                    parts.append(b["text"])
+        for k in ("text", "title", "summary"):
+            v = d.get(k)
+            if isinstance(v, str):
+                parts.append(v)
+    return "\n".join(parts) or data_str
+
+
+def opencode_find(query):
+    if not opencode_available():
+        return []
+    rows_out = []
+    conn = None
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % OPENCODE_DB, uri=True,
+                               timeout=5)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT p.session_id AS sid, p.data AS pdata, p.time_created AS pts,
+                   s.directory AS dir, s.parent_id AS parent_id,
+                   s.title AS title, s.agent AS agent,
+                   s.time_updated AS sts
+            FROM part p
+            JOIN session s ON p.session_id = s.id
+            WHERE lower(p.data) LIKE lower(?)
+            ORDER BY p.time_created DESC
+            LIMIT 400
+            """, ("%" + query + "%",))
+        rows_out = cur.fetchall()
+    except Exception:
+        rows_out = []
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
     seen = set()
-    for path in find_candidates(query):
-        sid, is_sub = resumable_session(path)
+    results = []
+    for r in rows_out:
+        sid = r["sid"]
         if sid in seen:
             continue
-        r = first_match(path, query)
-        if not r:
+        snippet = first_text_match(_opencode_text(r["pdata"]), query)
+        if snippet is None:
+            snippet = raw_snippet(r["pdata"], query)
+        if snippet is None:
             continue
         seen.add(sid)
-        cwd, ts, snippet = r
-        tag = " ↳ sub-agent" if is_sub else ""
-        left = (highlight(snippet, query) + "  "
-                + DIM + "· " + abbrev(cwd) + tag + RESET)
+        is_sub = bool(r["parent_id"])
+        resume_sid = r["parent_id"] if is_sub else sid
+        ts = r["sts"] or r["pts"]
+        results.append({
+            "source": "opencode", "sid": resume_sid,
+            "display_id": sid, "is_sub": is_sub,
+            "cwd": r["dir"], "ts": ts, "snippet": snippet,
+            "row_path": "opencode:" + sid,
+        })
+    return results[:MAX_FILES]
+
+
+def opencode_resume_argv(row):
+    return row.get("cwd"), ["opencode", "--session", row["sid"]]
+
+
+# =====================
+# Dispatch
+# =====================
+SOURCES = {
+    "claude":   {"find": claude_find,   "resume": claude_resume_argv,
+                 "available": claude_available},
+    "hermes":   {"find": hermes_find,   "resume": hermes_resume_argv,
+                 "available": hermes_available},
+    "opencode": {"find": opencode_find, "resume": opencode_resume_argv,
+                 "available": opencode_available},
+}
+
+
+def _encode_field1(row):
+    # source|sid|is_sub|row_path  (row_path is last; may contain any chars)
+    return "{}|{}|{}|{}".format(
+        row["source"], row["sid"], 1 if row.get("is_sub") else 0,
+        row.get("row_path") or "")
+
+
+def _decode_field1(field1):
+    parts = field1.split("|", 3)
+    if len(parts) < 4:
+        return {"source": "claude", "sid": "", "is_sub": False,
+                "row_path": field1}
+    source, sid, is_sub_s, row_path = parts
+    return {"source": source, "sid": sid,
+            "is_sub": (is_sub_s == "1"), "row_path": row_path}
+
+
+def backend(query, enabled=None):
+    if len(query.strip()) < 2:
+        return
+    all_rows = []
+    for name, src in SOURCES.items():
+        if enabled and name not in enabled:
+            continue
+        if not src["available"]():
+            continue
+        try:
+            all_rows.extend(src["find"](query))
+        except Exception:
+            continue
+    all_rows.sort(key=lambda r: ts_key(r.get("ts")), reverse=True)
+    seen = set()
+    emitted = 0
+    for r in all_rows:
+        key = (r["source"], r["sid"])
+        if key in seen:
+            continue
+        seen.add(key)
+        tag = " ↳ sub-agent" if r.get("is_sub") else ""
+        badge = BADGES.get(r["source"], "[?]")
+        cwd_disp = abbrev(r["cwd"]) if r.get("cwd") else "?"
+        left = (badge + " " + highlight(r["snippet"], query) + "  "
+                + DIM + "· " + cwd_disp + tag + RESET)
         left = left.replace("\t", " ").replace("\n", " ")
-        disp = align_right(left, fmt_ts(ts))
-        cwd_f = (cwd or "").replace("\t", " ")
-        ts_f = (ts or "").replace("\t", " ")
-        sys.stdout.write(f"{path}\t{cwd_f}\t{ts_f}\t{disp}\n")
+        disp = align_right(left, fmt_ts(r.get("ts")))
+        field1 = _encode_field1(r)
+        cwd_f = (r.get("cwd") or "").replace("\t", " ")
+        ts_f = str(r.get("ts") or "").replace("\t", " ")
+        sys.stdout.write(f"{field1}\t{cwd_f}\t{ts_f}\t{disp}\n")
         emitted += 1
         if emitted >= MAX_RESULTS:
             break
 
 
-def preview(path, query):
-    sid, is_sub = resumable_session(path)
-    cwd = ts = snippet = None
-    if query:
-        r = first_match(path, query)
-        if r:
-            cwd, ts, snippet = r
-    print(BOLD + "Session  " + RESET + CYAN + sid + RESET
-          + (DIM + "  (resumable parent)" + RESET if is_sub else ""))
-    if is_sub:
-        print(BOLD + "Match in " + RESET + DIM + os.path.basename(path)
+def preview(field1, query):
+    info = _decode_field1(field1)
+    source = info["source"]
+    sid = info["sid"]
+    is_sub = info["is_sub"]
+    row_path = info["row_path"]
+    badge = BADGES.get(source, source)
+    print(BOLD + "Source   " + RESET + badge + " " + source)
+    print(BOLD + "Session  " + RESET + CYAN + sid + RESET +
+          (DIM + "  (resumable parent)" + RESET if is_sub else ""))
+    if source == "claude" and is_sub:
+        print(BOLD + "Match in " + RESET + DIM + os.path.basename(row_path)
               + " (sub-agent)" + RESET)
-    print(BOLD + "Dir      " + RESET + abbrev(cwd))
-    if ts:
-        print(BOLD + "Time     " + RESET + ts)
-    print()
-    if snippet:
-        print(highlight(snippet, query))
+    elif source == "hermes":
+        m = re.search(r"/profiles/([^/]+)/", row_path)
+        if m:
+            print(BOLD + "Profile  " + RESET + m.group(1))
+    elif source == "opencode" and is_sub:
+        print(BOLD + "Sub      " + RESET + DIM + row_path + RESET)
+    if source in SOURCES:
+        try:
+            rows = SOURCES[source]["find"](query)
+        except Exception:
+            rows = []
+        match = next((r for r in rows
+                      if r.get("row_path") == row_path), None)
+        if not match:
+            match = next((r for r in rows if r["sid"] == sid), None)
+        if match:
+            print(BOLD + "Dir      " + RESET + abbrev(match.get("cwd") or "?"))
+            ts = match.get("ts")
+            if ts:
+                print(BOLD + "Time     " + RESET + str(ts)[:24])
+            print()
+            print(highlight(match.get("snippet", ""), query))
 
 
-def launch():
+def launch(enabled=None):
     self = os.path.abspath(__file__)
     me = shlex.quote(self)
-    backend_cmd = f"{me} --backend {{q}}"
+    src_arg = ""
+    if enabled:
+        src_arg = " --source " + ",".join(sorted(enabled))
+    backend_cmd = f"{me}{src_arg} --backend {{q}}"
     preview_cmd = f"{me} --preview {{1}} {{q}}"
+    detected = [n for n, s in SOURCES.items() if s["available"]()]
+    if enabled:
+        detected = [n for n in detected if n in enabled]
+    header = ("agents: " + (", ".join(detected) if detected else "none detected")
+              + " · type to search · enter resume · esc quit")
     cmd = [
         "fzf",
         "--ansi", "--disabled",
@@ -292,7 +636,7 @@ def launch():
         "--layout", "reverse",
         "--info", "inline",
         "--prompt", "search> ",
-        "--header", "type to search your Claude conversations · enter = resume · esc = quit",
+        "--header", header,
         "--bind", f"start:reload({backend_cmd})",
         "--bind", f"change:reload({backend_cmd})",
         "--preview", preview_cmd,
@@ -301,36 +645,74 @@ def launch():
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
     except FileNotFoundError:
-        sys.exit("ccfind: fzf not found (brew install fzf)")
+        sys.exit("ccfind: fzf not found (brew install fzf, "
+                 "or nix run github:coolcorexix/claude-grep)")
     line = (res.stdout or "").strip()
     if res.returncode != 0 or not line:
         return
     fields = line.split("\t")
     if len(fields) < 2:
         return
-    path, cwd = fields[0], fields[1]
-    sid, is_sub = resumable_session(path)
-    if is_sub:
-        project_dir = os.path.dirname(os.path.dirname(os.path.dirname(path)))
-        parent_cwd = read_cwd(os.path.join(project_dir, sid + ".jsonl"))
-        if parent_cwd:
-            cwd = parent_cwd
+    info = _decode_field1(fields[0])
+    fallback_cwd = fields[1] or None
+    source = info["source"]
+    if source not in SOURCES:
+        sys.exit(f"ccfind: unknown source {source!r}")
+    row = {
+        "source": source, "sid": info["sid"],
+        "is_sub": info["is_sub"], "row_path": info["row_path"],
+        "cwd": fallback_cwd,
+    }
+    cwd, argv = SOURCES[source]["resume"](row)
     if cwd and os.path.isdir(cwd):
         os.chdir(cwd)
     elif cwd:
-        sys.stderr.write(f"ccfind: original dir missing ({cwd}); resuming from here\n")
-    os.execvp("claude", ["claude", "--resume", sid])
+        sys.stderr.write(
+            f"ccfind: original dir missing ({cwd}); resuming from here\n")
+    try:
+        os.execvp(argv[0], argv)
+    except FileNotFoundError:
+        sys.exit(f"ccfind: command not found: {argv[0]}")
+
+
+def _parse_sources(arg):
+    names = [s.strip().lower() for s in arg.split(",") if s.strip()]
+    bad = [n for n in names if n not in SOURCES]
+    if bad:
+        sys.exit("ccfind: unknown source(s): " + ", ".join(bad)
+                 + " (known: " + ", ".join(SOURCES) + ")")
+    return set(names) if names else None
 
 
 def main():
     args = sys.argv[1:]
+    enabled = None
+    i = 0
+    rest = []
+    while i < len(args):
+        a = args[i]
+        if a == "--source" and i + 1 < len(args):
+            enabled = _parse_sources(args[i + 1])
+            i += 2
+        elif a.startswith("--source="):
+            enabled = _parse_sources(a.split("=", 1)[1])
+            i += 1
+        else:
+            rest.append(a)
+            i += 1
+    args = rest
+
     if not args:
-        launch()
+        launch(enabled)
     elif args[0] == "--backend":
-        backend(args[1] if len(args) > 1 else "")
+        backend(args[1] if len(args) > 1 else "", enabled)
     elif args[0] == "--preview":
         preview(args[1] if len(args) > 1 else "",
                 args[2] if len(args) > 2 else "")
+    elif args[0] == "--sources":
+        for n, s in SOURCES.items():
+            ok = s["available"]()
+            print(f"  {n}: {'AVAILABLE' if ok else 'not detected'}")
     else:
         sys.exit(__doc__)
 

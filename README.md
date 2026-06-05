@@ -64,6 +64,22 @@ ccfind
 - **Sub-agent aware:** sub-agent transcripts (`<project>/<PARENT-UUID>/subagents/agent-*.jsonl`) can't be resumed directly, so `claude-grep` resolves them to their **parent** session and resumes that — using the parent's working directory, so it works even if the sub-agent ran in a now-deleted git worktree.
 - **Deduped:** one row per resumable conversation, newest first.
 
+## Multi-agent: Claude Code · OpenCode · Hermes
+
+If you also use **OpenCode** or **Hermes**, `ccfind` searches their conversation history alongside Claude Code's — from the same UI. It auto-detects which agents are installed and tags each row by source:
+
+- `[c]` **Claude Code** — JSONL transcripts under `~/.claude/projects/`
+- `[h]` **Hermes** — sessions under `~/.hermes/sessions/` and `~/.hermes/profiles/<name>/sessions/`
+- `[o]` **OpenCode** — the SQLite db at `~/.local/share/opencode/opencode.db`
+
+Press **Enter** on any row and `ccfind` routes to the right agent's resume command (`claude --resume` / `hermes --resume` / `opencode --session`). Sub-agent sessions (Claude or OpenCode) auto-resolve to their resumable parent.
+
+```sh
+ccfind --sources               # see which agents are detected
+ccfind --source claude         # search only one
+ccfind --source claude,hermes  # or a subset
+```
+
 ## FAQ
 
 **How do I search my Claude Code conversation history?**
