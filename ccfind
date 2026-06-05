@@ -20,6 +20,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import uuid as _uuid_mod
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
@@ -610,9 +611,110 @@ def preview(field1, query):
             print(BOLD + "Dir      " + RESET + abbrev(match.get("cwd") or "?"))
             ts = match.get("ts")
             if ts:
-                print(BOLD + "Time     " + RESET + str(ts)[:24])
+                pretty = fmt_ts(ts)
+                print(BOLD + "Match at " + RESET + YELLOW + (pretty or str(ts)[:24]) + RESET +
+                      (DIM + "  " + str(ts)[:24] + RESET if pretty and str(ts)[:16] not in pretty else ""))
             print()
             print(highlight(match.get("snippet", ""), query))
+            print()
+            print(DIM + "tip: pressing Enter resumes the session at its LATEST state." + RESET)
+            print(DIM + "     if the session covered multiple topics, scroll up to the match time above." + RESET)
+
+
+def branch_claude_session(parent_path, parent_sid, checkpoint_uuid):
+    """Fork a Claude Code session at checkpoint_uuid (a user-message uuid).
+    Copies every entry from the parent up to (but NOT including) the next user
+    message after the checkpoint — i.e. includes the user message + its full
+    assistant response. Rewrites sessionId; tags every copied entry with
+    `forkedFrom: {sessionId, messageUuid}` (matching Claude Code's own /btw).
+    Returns (new_sid, new_path)."""
+    entries = []
+    with open(parent_path, "r", errors="replace") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+    cp_idx = next((i for i, e in enumerate(entries)
+                   if e.get("uuid") == checkpoint_uuid), None)
+    if cp_idx is None:
+        raise ValueError(f"checkpoint uuid {checkpoint_uuid} not found in {parent_path}")
+    end_idx = len(entries)
+    for j in range(cp_idx + 1, len(entries)):
+        if entries[j].get("type") == "user":
+            end_idx = j
+            break
+    copied = [dict(e) for e in entries[:end_idx]]
+    new_sid = str(_uuid_mod.uuid4())
+    forked = {"sessionId": parent_sid, "messageUuid": checkpoint_uuid}
+    for e in copied:
+        e["sessionId"] = new_sid
+        e["forkedFrom"] = forked
+    new_path = os.path.join(os.path.dirname(parent_path), new_sid + ".jsonl")
+    with open(new_path, "w") as fh:
+        for e in copied:
+            fh.write(json.dumps(e, ensure_ascii=False))
+            fh.write("\n")
+    return new_sid, new_path
+
+
+def branch_flow_claude(parent_path, parent_sid):
+    """Interactive branch picker. Lists user messages in the session via fzf;
+    user picks one; creates the fork. Returns (new_sid, new_path) or None."""
+    entries = []
+    with open(parent_path, "r", errors="replace") as fh:
+        for line in fh:
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+    candidates = []
+    for e in entries:
+        if e.get("type") != "user":
+            continue
+        msg = e.get("message")
+        c = msg.get("content") if isinstance(msg, dict) else None
+        text = ""
+        if isinstance(c, str):
+            text = c
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                    text = b["text"]
+                    break
+        text = re.sub(r"\s+", " ", text or "").strip()
+        if not text:
+            continue
+        uid = e.get("uuid", "")
+        ts = e.get("timestamp", "")
+        if uid:
+            candidates.append((uid, ts, text[:240]))
+    if not candidates:
+        sys.exit("ccfind: no branchable user messages found in this session")
+    lines = []
+    for uid, ts, text in candidates:
+        when = fmt_ts(ts) if ts else "             "
+        # field 1 = uuid (hidden), field 2 = display (timestamp + preview)
+        lines.append(f"{uid}\t{DIM}{when}{RESET} {text}")
+    fzf_input = "\n".join(lines)
+    try:
+        res = subprocess.run(
+            ["fzf", "--ansi", "--delimiter", "\t", "--with-nth", "2",
+             "--layout", "reverse", "--height", "70%",
+             "--prompt", "branch from> ",
+             "--header", "pick a user message to branch from  "
+                         "(↑↓ move · enter pick · esc cancel)"],
+            input=fzf_input, stdout=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        sys.exit("ccfind: fzf not found")
+    line = (res.stdout or "").strip()
+    if res.returncode != 0 or not line:
+        return None
+    chosen_uid = line.split("\t", 1)[0]
+    return branch_claude_session(parent_path, parent_sid, chosen_uid)
 
 
 def launch(enabled=None):
@@ -627,7 +729,7 @@ def launch(enabled=None):
     if enabled:
         detected = [n for n in detected if n in enabled]
     header = ("agents: " + (", ".join(detected) if detected else "none detected")
-              + " · type to search · enter resume · esc quit")
+              + " · enter resume · ctrl-b branch · esc quit")
     cmd = [
         "fzf",
         "--ansi", "--disabled",
@@ -637,6 +739,7 @@ def launch(enabled=None):
         "--info", "inline",
         "--prompt", "search> ",
         "--header", header,
+        "--expect", "ctrl-b",
         "--bind", f"start:reload({backend_cmd})",
         "--bind", f"change:reload({backend_cmd})",
         "--preview", preview_cmd,
@@ -647,10 +750,15 @@ def launch(enabled=None):
     except FileNotFoundError:
         sys.exit("ccfind: fzf not found (brew install fzf, "
                  "or nix run github:coolcorexix/claude-grep)")
-    line = (res.stdout or "").strip()
-    if res.returncode != 0 or not line:
+    out = res.stdout or ""
+    # With --expect, fzf prints the pressed key on the first line (empty=Enter),
+    # then the selection on the next line.
+    parts = out.split("\n", 1)
+    pressed_key = parts[0].strip()
+    selection_line = (parts[1].strip() if len(parts) > 1 else "")
+    if res.returncode != 0 or not selection_line:
         return
-    fields = line.split("\t")
+    fields = selection_line.split("\t")
     if len(fields) < 2:
         return
     info = _decode_field1(fields[0])
@@ -658,6 +766,36 @@ def launch(enabled=None):
     source = info["source"]
     if source not in SOURCES:
         sys.exit(f"ccfind: unknown source {source!r}")
+
+    # Ctrl-B → branch (fork the session from a chosen user message)
+    if pressed_key == "ctrl-b":
+        if source != "claude":
+            sys.exit(f"ccfind: branching not yet supported for {source!r} "
+                     "(claude only in this MVP)")
+        parent_path = info["row_path"]
+        parent_sid = info["sid"]
+        if info["is_sub"]:
+            proj_dir = os.path.dirname(os.path.dirname(os.path.dirname(parent_path)))
+            parent_path = os.path.join(proj_dir, parent_sid + ".jsonl")
+        try:
+            result = branch_flow_claude(parent_path, parent_sid)
+        except Exception as e:
+            sys.exit(f"ccfind: branch failed: {e}")
+        if not result:
+            return
+        new_sid, new_path = result
+        sys.stderr.write(
+            f"ccfind: created branch {new_sid} from {parent_sid} → resuming…\n")
+        cwd = _claude_read_cwd(parent_path) or fallback_cwd
+        if cwd and os.path.isdir(cwd):
+            os.chdir(cwd)
+        try:
+            os.execvp("claude", ["claude", "--resume", new_sid])
+        except FileNotFoundError:
+            sys.exit("ccfind: command not found: claude")
+        return
+
+    # Normal Enter → resume
     row = {
         "source": source, "sid": info["sid"],
         "is_sub": info["is_sub"], "row_path": info["row_path"],
