@@ -23,6 +23,16 @@ import sys
 import uuid as _uuid_mod
 from datetime import datetime
 
+# Make the sibling ccfind_core package importable in both dev (script run
+# from repo) and Nix installs (script lives in $out/bin, package lives in
+# $out/share/ccfind). Imports of ccfind_core happen lazily inside the
+# handlers that need them so users on older installs still get the search
+# UI even if the package is missing.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _candidate in (_HERE, os.path.join(os.path.dirname(_HERE), "share", "ccfind")):
+    if os.path.isdir(os.path.join(_candidate, "ccfind_core")) and _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+
 HOME = os.path.expanduser("~")
 MAX_FILES = 150
 MAX_RESULTS = 80
@@ -123,10 +133,16 @@ def abbrev(path):
     return path or "?"
 
 
+def _sep_pattern(q):
+    """Allow at most one non-alphanumeric char between each char of q.
+    Lets 'rSideProject' match 'r/SideProject', 'r-SideProject', etc."""
+    return "[^a-zA-Z0-9]?".join(re.escape(c) for c in q)
+
+
 def highlight(text, q):
     if not q:
         return text
-    return re.sub(re.escape(q),
+    return re.sub(_sep_pattern(q),
                   lambda m: YELLOW + m.group(0) + RESET,
                   text, flags=re.IGNORECASE)
 
@@ -157,16 +173,17 @@ def snippet_around(text, q, idx):
 def first_text_match(text, q):
     if not text or not q:
         return None
-    i = text.lower().find(q.lower())
-    if i == -1:
+    m = re.search(_sep_pattern(q), text, re.IGNORECASE)
+    if not m:
         return None
-    return snippet_around(text, q, i)
+    return snippet_around(text, q, m.start())
 
 
 def raw_snippet(raw, q):
-    i = raw.lower().find(q.lower())
-    if i == -1:
+    m = re.search(_sep_pattern(q), raw, re.IGNORECASE)
+    if not m:
         return None
+    i = m.start()
     seg = raw[max(0, i - 80): i + len(q) + 160]
     seg = (seg.replace("\\n", " ").replace("\\t", " ")
               .replace('\\"', '"').replace("\\\\", "\\"))
@@ -235,8 +252,8 @@ def claude_find(query):
         return []
     try:
         out = subprocess.run(
-            ["rg", "-l", "--no-ignore", "--hidden", "--fixed-strings",
-             "--ignore-case", "--", query, CLAUDE_ROOT],
+            ["rg", "-l", "--no-ignore", "--hidden",
+             "--ignore-case", "-e", _sep_pattern(query), CLAUDE_ROOT],
             capture_output=True, text=True, timeout=20)
         paths = [p for p in out.stdout.splitlines() if p.endswith(".jsonl")]
     except Exception:
@@ -342,9 +359,9 @@ def hermes_find(query):
         return []
     try:
         out = subprocess.run(
-            ["rg", "-l", "--no-ignore", "--hidden", "--fixed-strings",
+            ["rg", "-l", "--no-ignore", "--hidden",
              "--ignore-case", "--glob", "*.json", "--glob", "*.jsonl",
-             "--", query, HERMES_ROOT],
+             "-e", _sep_pattern(query), HERMES_ROOT],
             capture_output=True, text=True, timeout=20)
         paths = [p for p in out.stdout.splitlines()
                  if p.endswith((".json", ".jsonl"))]
@@ -729,7 +746,8 @@ def launch(enabled=None):
     if enabled:
         detected = [n for n in detected if n in enabled]
     header = ("agents: " + (", ".join(detected) if detected else "none detected")
-              + "\nEnter resume  ·  " + YELLOW + "Ctrl-B branch" + RESET + "  ·  Esc quit")
+              + "\nEnter resume  ·  " + YELLOW + "Ctrl-B branch" + RESET
+              + "  ·  " + YELLOW + "Ctrl-X port→claude" + RESET + "  ·  Esc quit")
     cmd = [
         "fzf",
         "--ansi", "--disabled",
@@ -739,7 +757,7 @@ def launch(enabled=None):
         "--info", "inline",
         "--prompt", "search> ",
         "--header", header,
-        "--expect", "ctrl-b",
+        "--expect", "ctrl-b,ctrl-x",
         "--bind", f"start:reload({backend_cmd})",
         "--bind", f"change:reload({backend_cmd})",
         "--preview", preview_cmd,
@@ -766,6 +784,73 @@ def launch(enabled=None):
     source = info["source"]
     if source not in SOURCES:
         sys.exit(f"ccfind: unknown source {source!r}")
+
+    # Ctrl-X → port a non-Claude session into Claude Code. Reads the source
+    # via ccfind_core's canonical IR, writes a fresh resumable Claude
+    # transcript, then resumes it. Supports opencode and hermes today.
+    if pressed_key == "ctrl-x":
+        if source == "claude":
+            sys.exit("ccfind: ctrl-x ports INTO Claude — selected row is "
+                     "already Claude. Use Enter to resume in place.")
+        if source not in ("opencode", "hermes"):
+            sys.exit(f"ccfind: ctrl-x not supported for {source!r}")
+        try:
+            from ccfind_core import adapters as _cc_adapters
+        except ImportError as e:
+            sys.exit(f"ccfind: ctrl-x needs the ccfind_core package "
+                     f"(import failed: {e}). Reinstall ccfind.")
+        if not _cc_adapters.can(source, "read"):
+            sys.exit(f"ccfind: ccfind_core has no reader for {source!r}")
+
+        sid = info["sid"]
+        sys.stderr.write(
+            f"ccfind: porting {source} session {sid} → Claude Code…\n")
+
+        read_kwargs = {}
+        # Hermes adapter benefits from a direct path (skips filesystem
+        # search). info["row_path"] for hermes is the .jsonl/.json path.
+        if source == "hermes" and info.get("row_path"):
+            read_kwargs["path"] = info["row_path"]
+
+        try:
+            conv = _cc_adapters.read(source, sid, **read_kwargs)
+        except Exception as e:
+            sys.exit(f"ccfind: failed to read {source} session: {e}")
+
+        # Provenance: stamp origin so the new transcript cites its source.
+        conv.metadata.setdefault("forkedFrom", {
+            "source_agent": source,
+            "source_session_id": sid,
+        })
+
+        # Pick a cwd for the new Claude session. OpenCode carries one;
+        # Hermes doesn't, so fall back to the search row's hint and then
+        # to the user's current dir.
+        port_cwd = conv.cwd or fallback_cwd
+        if port_cwd and (port_cwd.startswith("profile:") or not os.path.isdir(port_cwd)):
+            port_cwd = os.getcwd()
+        if not port_cwd:
+            port_cwd = os.getcwd()
+
+        try:
+            result = _cc_adapters.write("claude", conv, cwd=port_cwd)
+        except Exception as e:
+            sys.exit(f"ccfind: failed to write Claude transcript: {e}")
+        new_sid = result["session_id"]
+        cwd = result["cwd"]
+        sys.stderr.write(
+            f"ccfind: created Claude session {new_sid}\n"
+            f"        from {source}://{sid}\n"
+            f"        at {result['path']}\n"
+            f"        → resuming in {cwd}…\n"
+        )
+        if cwd and os.path.isdir(cwd):
+            os.chdir(cwd)
+        try:
+            os.execvp("claude", ["claude", "--resume", new_sid])
+        except FileNotFoundError:
+            sys.exit("ccfind: command not found: claude")
+        return
 
     # Ctrl-B → branch (fork the session from a chosen user message)
     if pressed_key == "ctrl-b":
