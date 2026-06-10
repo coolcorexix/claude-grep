@@ -887,6 +887,7 @@ def launch(enabled=None):
         "cwd": fallback_cwd,
     }
     cwd, argv = SOURCES[source]["resume"](row)
+    sys.stderr.write(f"ccfind: resuming {source} session {info['sid'][:8]}…\n")
     if cwd and os.path.isdir(cwd):
         os.chdir(cwd)
     elif cwd:

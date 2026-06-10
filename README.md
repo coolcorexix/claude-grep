@@ -80,6 +80,16 @@ ccfind --source claude         # search only one
 ccfind --source claude,hermes  # or a subset
 ```
 
+### Port a session into Claude Code (`Ctrl-X`)
+
+Press **`Ctrl-X`** on any **`[o]` OpenCode** or **`[h]` Hermes** row to **convert that session into a fresh, resumable Claude Code transcript** and jump straight into it. Under the hood `ccfind` reads the source (OpenCode SQLite or Hermes JSONL/JSON) through the canonical conversation IR (see below), writes a new JSONL under `~/.claude/projects/<slug>/<new-sid>.jsonl` with `forkedFrom` provenance pointing at the source, then `exec`s `claude --resume`.
+
+Tool calls, reasoning/thinking, text content, and inline images all carry over. For OpenCode, per-message provider details (model, cost, tokens) are preserved in metadata. For Hermes, OpenAI-style `tool_calls` are converted to Anthropic-style `tool_use` + `tool_result` blocks per Claude's convention.
+
+CWD selection: OpenCode sessions carry their own working directory and resume there. Hermes sessions don't, so the new Claude session opens in `ccfind`'s current directory (where you launched the search).
+
+> Directions today: **OpenCode → Claude**, **Hermes → Claude**. Claude → OpenCode and Claude → Hermes are on the roadmap (both targets track per-session economics fields or runtime-specific metadata that Claude transcripts don't carry, so the writers need to synthesize them).
+
 ## Branch any session at any message (prompt tree)
 
 Like `git checkout` from a commit — but for AI conversations. In the search UI, hit **`Ctrl-B`** instead of `Enter` on any row to:
@@ -96,6 +106,28 @@ Useful when:
 - you want to keep the original session intact while exploring an alternative path.
 
 > MVP supports Claude Code only; OpenCode and Hermes branching coming next.
+
+## Move conversations between agents (experimental)
+
+`ccfind` ships a small foundation — `ccfind_core` — for porting sessions across agent tools through a shared canonical IR. The same model is what cross-agent features (import/export, bidirectional fork, fan-out) will be built on.
+
+```sh
+ccfind-convert capabilities                       # see what each agent supports
+ccfind-convert list opencode --limit 5            # pick a session
+ccfind-convert convert --from opencode --to claude --session <opencode-sid>
+# → emits a fresh resumable Claude transcript, prints:
+#   { "session_id": "...", "path": "...", "resume_cmd": ["claude", "--resume", "..."] }
+```
+
+Use `--dry-run` to see the canonical-IR summary without writing anything to `~/.claude/`. Or `dump` to inspect the IR directly:
+
+```sh
+ccfind-convert dump --from claude --session <sid> --pretty
+```
+
+Status today: OpenCode → Claude Code works end-to-end. Claude → Claude works (useful for forking). Claude → OpenCode is deferred — OpenCode tracks per-session economics (model, provider, cost, token counters) that Claude transcripts don't carry, so the OpenCode writer needs to synthesize those. Hermes adapter is a stub.
+
+No community spec exists for stored-conversation portability (MCP, A2A, ACP, and Agent Client Protocol all standardize *live* interaction). The closest message-shape standard is [OpenTelemetry's GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) — `ccfind_core` uses Anthropic-style block names internally (so the Claude adapter is near-identity), and an OTel-conformant view can be derived by renaming `tool_use` ↔ `tool_call_request`, `tool_result` ↔ `tool_call_response`, `thinking` ↔ `reasoning`.
 
 ## FAQ
 

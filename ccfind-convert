@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""ccfind-convert — cross-agent conversation conversion via canonical IR.
+
+Thin wrapper that locates the ccfind_core package (sibling directory of
+this script or already importable) and dispatches to ccfind_core.cli.
+"""
+import os
+import sys
+
+
+def _ensure_package_importable():
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(here, "ccfind_core")
+    if os.path.isdir(candidate):
+        if here not in sys.path:
+            sys.path.insert(0, here)
+
+
+_ensure_package_importable()
+
+from ccfind_core.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

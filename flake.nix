@@ -20,11 +20,16 @@
             dontBuild = true;
             installPhase = ''
               runHook preInstall
-              mkdir -p $out/bin
+              mkdir -p $out/bin $out/share/ccfind
               install -m755 ccfind $out/bin/ccfind
-              patchShebangs $out/bin/ccfind
+              install -m755 ccfind-convert $out/bin/ccfind-convert
+              cp -r ccfind_core $out/share/ccfind/ccfind_core
+              patchShebangs $out/bin/ccfind $out/bin/ccfind-convert
               wrapProgram $out/bin/ccfind \
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fzf pkgs.ripgrep pkgs.python3 ]}
+              wrapProgram $out/bin/ccfind-convert \
+                --prefix PYTHONPATH : $out/share/ccfind \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.python3 ]}
               runHook postInstall
             '';
             meta = with pkgs.lib; {
