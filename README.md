@@ -6,7 +6,7 @@
 
 ## Demo
 
-![claude-grep — live content search over your Claude Code conversation transcripts](demo.png)
+![claude-grep — live content search over your Claude Code conversation transcripts, plus Ctrl-X porting and Ctrl-B branching](demo.gif)
 
 ## Why
 
