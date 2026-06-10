@@ -164,3 +164,7 @@ Yes. Sub-agent transcripts aren't resumable on their own, so `claude-grep` autom
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+More tools by the same author: [nemothecollector.dev/products](https://nemothecollector.dev/products)
