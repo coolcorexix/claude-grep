@@ -9,6 +9,8 @@ Usage:
   ccfind                      launch interactive search across all detected agents
   ccfind --source claude,hermes
                               limit to specific agents (comma-separated)
+  ccfind --user-only | -u     match only text YOU typed, not AI responses or
+                              tool output (toggle inside the UI with Ctrl-U)
   ccfind --sources            list which agents are detected on this machine
   ccfind --backend Q          (internal) emit matching rows for query Q
   ccfind --preview F Q        (internal) render the preview pane
@@ -51,6 +53,12 @@ BADGES = {
     "hermes":   "\x1b[38;5;213m[h]\x1b[0m",
     "opencode": "\x1b[38;5;215m[o]\x1b[0m",
 }
+
+# fzf prompts double as the mode flag: backend/preview subprocesses spawned by
+# fzf read FZF_PROMPT from the environment to know whether the user-only
+# filter is active (fzf exports it to reload/preview commands).
+PROMPT_ALL = "search> "
+PROMPT_USER = "user> "
 
 CLAUDE_ROOT = os.path.join(HOME, ".claude", "projects")
 HERMES_ROOT = os.path.join(HOME, ".hermes")
@@ -224,6 +232,35 @@ def _claude_extract_text(entry):
     return "\n".join(parts)
 
 
+# Blocks the Claude Code harness embeds INSIDE user messages that aren't the
+# user's own words: system reminders, and the output of `!`-prefix / slash
+# commands (the typed command itself stays searchable).
+_CLAUDE_INJECTED_RE = re.compile(
+    r"<(system-reminder|bash-stdout|bash-stderr|local-command-stdout|"
+    r"local-command-stderr)>.*?</\1>", re.DOTALL)
+
+
+def _claude_extract_user_text(entry):
+    """Only text the user actually typed: user-type entries, text blocks only
+    (tool_result blocks ride on user entries but are tool output, not the
+    user's words). isMeta entries are harness-injected, not the user."""
+    if entry.get("type") != "user" or entry.get("isMeta"):
+        return ""
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return ""
+    c = msg.get("content")
+    parts = []
+    if isinstance(c, str):
+        parts.append(c)
+    elif isinstance(c, list):
+        for b in c:
+            if (isinstance(b, dict) and b.get("type") == "text"
+                    and isinstance(b.get("text"), str)):
+                parts.append(b["text"])
+    return _CLAUDE_INJECTED_RE.sub("", "\n".join(parts))
+
+
 def claude_resumable(path):
     parent_dir = os.path.dirname(path)
     if os.path.basename(parent_dir) == "subagents":
@@ -247,9 +284,10 @@ def _claude_read_cwd(path):
     return None
 
 
-def claude_find(query):
+def claude_find(query, user_only=False):
     if not claude_available():
         return []
+    extract = _claude_extract_user_text if user_only else _claude_extract_text
     try:
         out = subprocess.run(
             ["rg", "-l", "--no-ignore", "--hidden",
@@ -280,7 +318,7 @@ def claude_find(query):
                     if cwd is None and isinstance(entry.get("cwd"), str):
                         cwd = entry["cwd"]
                     if snippet is None:
-                        txt = _claude_extract_text(entry)
+                        txt = extract(entry)
                         if txt:
                             s = first_text_match(txt, query)
                             if s:
@@ -290,7 +328,9 @@ def claude_find(query):
                         break
         except Exception:
             continue
-        if snippet is None and raw_hit is not None:
+        # raw fallback matches anywhere in the line (incl. AI/tool content),
+        # so it would defeat the user-only filter — skip it in that mode.
+        if snippet is None and raw_hit is not None and not user_only:
             snippet = raw_snippet(raw_hit, query)
         if snippet is None:
             continue
@@ -335,10 +375,12 @@ def hermes_sid_from_path(path):
     return base
 
 
-def _hermes_text_from_json(d):
+def _hermes_text_from_json(d, user_only=False):
     parts = []
     for m in d.get("messages", []) or []:
         if not isinstance(m, dict):
+            continue
+        if user_only and m.get("role") != "user":
             continue
         c = m.get("content")
         if isinstance(c, str):
@@ -349,12 +391,12 @@ def _hermes_text_from_json(d):
                     parts.append(b["text"])
                 elif isinstance(b, str):
                     parts.append(b)
-    if isinstance(d.get("title"), str):
+    if not user_only and isinstance(d.get("title"), str):
         parts.append(d["title"])
     return "\n".join(parts)
 
 
-def hermes_find(query):
+def hermes_find(query, user_only=False):
     if not hermes_available():
         return []
     try:
@@ -384,6 +426,10 @@ def hermes_find(query):
                             e = json.loads(line)
                         except Exception:
                             continue
+                        if ts is None and e.get("timestamp"):
+                            ts = e["timestamp"]
+                        if user_only and e.get("role") != "user":
+                            continue
                         c = e.get("content")
                         if isinstance(c, str):
                             texts.append(c)
@@ -391,8 +437,6 @@ def hermes_find(query):
                             for b in c:
                                 if isinstance(b, dict) and isinstance(b.get("text"), str):
                                     texts.append(b["text"])
-                        if ts is None and e.get("timestamp"):
-                            ts = e["timestamp"]
                 snippet = first_text_match("\n".join(texts), query)
             else:
                 with open(path, "r", errors="replace") as fh:
@@ -404,10 +448,11 @@ def hermes_find(query):
                     if d.get("session_id"):
                         sid = d["session_id"]
                     ts = d.get("last_updated") or d.get("session_start")
-                    snippet = first_text_match(_hermes_text_from_json(d), query)
+                    snippet = first_text_match(
+                        _hermes_text_from_json(d, user_only), query)
         except Exception:
             continue
-        if snippet is None:
+        if snippet is None and not user_only:
             try:
                 with open(path, "r", errors="replace") as fh:
                     snippet = raw_snippet(fh.read(), query)
@@ -470,9 +515,14 @@ def _opencode_text(data_str):
     return "\n".join(parts) or data_str
 
 
-def opencode_find(query):
+def opencode_find(query, user_only=False):
     if not opencode_available():
         return []
+    join = role = ""
+    if user_only:
+        # role lives on the message row's JSON metadata, not the part
+        join = "JOIN message m ON p.message_id = m.id"
+        role = "AND json_extract(m.data, '$.role') = 'user'"
     rows_out = []
     conn = None
     try:
@@ -481,14 +531,15 @@ def opencode_find(query):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
-            """
+            f"""
             SELECT p.session_id AS sid, p.data AS pdata, p.time_created AS pts,
                    s.directory AS dir, s.parent_id AS parent_id,
                    s.title AS title, s.agent AS agent,
                    s.time_updated AS sts
             FROM part p
             JOIN session s ON p.session_id = s.id
-            WHERE lower(p.data) LIKE lower(?)
+            {join}
+            WHERE lower(p.data) LIKE lower(?) {role}
             ORDER BY p.time_created DESC
             LIMIT 400
             """, ("%" + query + "%",))
@@ -559,7 +610,13 @@ def _decode_field1(field1):
             "is_sub": (is_sub_s == "1"), "row_path": row_path}
 
 
-def backend(query, enabled=None):
+def _env_user_only():
+    """fzf exports FZF_PROMPT to reload/preview subprocesses; the prompt is
+    how the in-UI Ctrl-U toggle communicates the mode to us."""
+    return os.environ.get("FZF_PROMPT") == PROMPT_USER
+
+
+def backend(query, enabled=None, user_only=False):
     if len(query.strip()) < 2:
         return
     all_rows = []
@@ -569,7 +626,7 @@ def backend(query, enabled=None):
         if not src["available"]():
             continue
         try:
-            all_rows.extend(src["find"](query))
+            all_rows.extend(src["find"](query, user_only))
         except Exception:
             continue
     all_rows.sort(key=lambda r: ts_key(r.get("ts")), reverse=True)
@@ -596,7 +653,7 @@ def backend(query, enabled=None):
             break
 
 
-def preview(field1, query):
+def preview(field1, query, user_only=False):
     info = _decode_field1(field1)
     source = info["source"]
     sid = info["sid"]
@@ -617,7 +674,7 @@ def preview(field1, query):
         print(BOLD + "Sub      " + RESET + DIM + row_path + RESET)
     if source in SOURCES:
         try:
-            rows = SOURCES[source]["find"](query)
+            rows = SOURCES[source]["find"](query, user_only)
         except Exception:
             rows = []
         match = next((r for r in rows
@@ -734,7 +791,19 @@ def branch_flow_claude(parent_path, parent_sid):
     return branch_claude_session(parent_path, parent_sid, chosen_uid)
 
 
-def launch(enabled=None):
+def _fzf_version():
+    try:
+        out = subprocess.run(["fzf", "--version"], capture_output=True,
+                             text=True, timeout=5).stdout or ""
+        m = re.match(r"(\d+)\.(\d+)", out.strip())
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return (0, 0)
+
+
+def launch(enabled=None, user_only=False):
     self = os.path.abspath(__file__)
     me = shlex.quote(self)
     src_arg = ""
@@ -747,7 +816,17 @@ def launch(enabled=None):
         detected = [n for n in detected if n in enabled]
     header = ("agents: " + (", ".join(detected) if detected else "none detected")
               + "\nEnter resume  ·  " + YELLOW + "Ctrl-B branch" + RESET
-              + "  ·  " + YELLOW + "Ctrl-X port→claude" + RESET + "  ·  Esc quit")
+              + "  ·  " + YELLOW + "Ctrl-X port→claude" + RESET
+              + "  ·  " + YELLOW + "Ctrl-U user-only" + RESET + "  ·  Esc quit")
+    # Ctrl-U flips the prompt (which IS the mode — backend reads FZF_PROMPT
+    # from its env) and reloads. `\{q}` keeps the placeholder literal through
+    # the transform so fzf expands it safely at reload time.
+    backend_cmd_lit = f"{me}{src_arg} --backend \\{{q}}"
+    toggle = ('transform:case "$FZF_PROMPT" in '
+              f'"{PROMPT_USER}") echo "change-prompt({PROMPT_ALL})'
+              f'+reload({backend_cmd_lit})";; '
+              f'*) echo "change-prompt({PROMPT_USER})'
+              f'+reload({backend_cmd_lit})";; esac')
     cmd = [
         "fzf",
         "--ansi", "--disabled",
@@ -755,14 +834,19 @@ def launch(enabled=None):
         "--with-nth", "4",
         "--layout", "reverse",
         "--info", "inline",
-        "--prompt", "search> ",
+        "--prompt", PROMPT_USER if user_only else PROMPT_ALL,
         "--header", header,
         "--expect", "ctrl-b,ctrl-x",
         "--bind", f"start:reload({backend_cmd})",
         "--bind", f"change:reload({backend_cmd})",
+        "--bind", f"ctrl-u:{toggle}",
         "--preview", preview_cmd,
         "--preview-window", "down,45%,wrap,border-top",
     ]
+    if _fzf_version() >= (0, 62):
+        cmd += ["--ghost",
+                "type a phrase from any past session (2+ chars) — "
+                "Ctrl-U to match only what you typed"]
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
     except FileNotFoundError:
@@ -911,6 +995,7 @@ def _parse_sources(arg):
 def main():
     args = sys.argv[1:]
     enabled = None
+    user_only = False
     i = 0
     rest = []
     while i < len(args):
@@ -921,18 +1006,23 @@ def main():
         elif a.startswith("--source="):
             enabled = _parse_sources(a.split("=", 1)[1])
             i += 1
+        elif a in ("--user-only", "-u"):
+            user_only = True
+            i += 1
         else:
             rest.append(a)
             i += 1
     args = rest
 
     if not args:
-        launch(enabled)
+        launch(enabled, user_only)
     elif args[0] == "--backend":
-        backend(args[1] if len(args) > 1 else "", enabled)
+        backend(args[1] if len(args) > 1 else "", enabled,
+                user_only or _env_user_only())
     elif args[0] == "--preview":
         preview(args[1] if len(args) > 1 else "",
-                args[2] if len(args) > 2 else "")
+                args[2] if len(args) > 2 else "",
+                user_only or _env_user_only())
     elif args[0] == "--sources":
         for n, s in SOURCES.items():
             ok = s["available"]()

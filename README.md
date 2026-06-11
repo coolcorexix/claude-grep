@@ -55,12 +55,14 @@ ccfind
 
 - **Type** a phrase — results refresh live as you type.
 - **↑/↓** move · **Enter** resumes the selected conversation · **Esc** quits.
+- **Ctrl-U** toggles **user-only mode** (prompt flips to `user> `) — match only what *you* typed, ignoring AI responses and tool output. Great for narrowing results when you remember your own words but the phrase appears in dozens of AI replies. Start in this mode with `ccfind --user-only` (or `-u`).
 - Each row shows the matched snippet (phrase highlighted), the conversation's working directory (dimmed), and the message timestamp (right-aligned). The preview pane shows the session id, directory, and time.
 
 ## How it works
 
 - **Fast:** `ripgrep` narrows thousands of transcripts to candidates in milliseconds; only those files are parsed in Python for clean, highlighted snippets. No index, nothing running in the background.
 - **Searches real content:** your prompts, Claude's replies, and tool results — matches *inside* a tool call (e.g. a shell command) still surface via a raw fallback.
+- **User-only mode** (`Ctrl-U` / `--user-only`): restricts matching to text the user actually typed — assistant replies, tool output, and harness-injected blocks (system reminders, `!`-command output) are excluded across all three sources.
 - **Sub-agent aware:** sub-agent transcripts (`<project>/<PARENT-UUID>/subagents/agent-*.jsonl`) can't be resumed directly, so `claude-grep` resolves them to their **parent** session and resumes that — using the parent's working directory, so it works even if the sub-agent ran in a now-deleted git worktree.
 - **Deduped:** one row per resumable conversation, newest first.
 
@@ -78,6 +80,7 @@ Press **Enter** on any row and `ccfind` routes to the right agent's resume comma
 ccfind --sources               # see which agents are detected
 ccfind --source claude         # search only one
 ccfind --source claude,hermes  # or a subset
+ccfind --user-only             # match only what YOU typed (alias -u; Ctrl-U in the UI)
 ```
 
 ### Port a session into Claude Code (`Ctrl-X`)
