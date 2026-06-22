@@ -63,7 +63,10 @@ def main():
     print(f"  → Path: {out_path}")
     print(f"  → Resume CWD: {result['cwd']}")
 
-    real_root = os.path.expanduser("~/.claude/projects")
+    # The adapter writes to the active account's config dir (CLAUDE_CONFIG_DIR
+    # if set, else ~/.claude), so derive the expected root the same way.
+    real_base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    real_root = os.path.join(real_base, "projects")
     assert out_path.startswith(real_root + os.sep), out_path
 
     seen_uuids = set()

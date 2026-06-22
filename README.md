@@ -159,6 +159,18 @@ Yes. Sub-agent transcripts aren't resumable on their own, so `claude-grep` autom
 | Resumes sub-agent sessions                   | ✗                            | ✓ (via parent)             |
 | Live, as-you-type search                     | ✗                            | ✓                          |
 
+## Troubleshooting
+
+**I use multiple Claude accounts / profiles — will it find all my conversations?**
+Yes. People who run several Claude logins on one machine give each its own config dir via `CLAUDE_CONFIG_DIR` (the default `~/.claude`, plus e.g. `~/.claude-work`, `~/.claude-personal`). `claude --resume` only ever sees the *active* account, which is why a session from another login fails with **"conversation ID does not exist"**. `claude-grep` works around this:
+
+- It searches **every** account it can find: the active `$CLAUDE_CONFIG_DIR`, the default `~/.claude`, and any `~/.claude-*` dirs in your home folder.
+- When you resume (or branch/port) a result, it automatically points `claude` at the account that actually owns that transcript — so cross-account resume just works, no manual switching.
+
+Run `ccfind --sources` to see which accounts were detected (multiple accounts are listed under `claude:`).
+
+Two caveats for **inactive** accounts to be auto-discovered: they must live in your home dir and be named `~/.claude` or `~/.claude-<something>`. An inactive account parked somewhere non-standard (e.g. `~/.config/claude-job`) won't be picked up until you switch to it (at which point it's the active `$CLAUDE_CONFIG_DIR` and is searched regardless of name). The simplest fix is to keep your config dirs named `~/.claude-*`.
+
 ## Limitations
 
 - The right-aligned timestamp is sized to the terminal width at search time; resizing the terminal corrects on the next keystroke.

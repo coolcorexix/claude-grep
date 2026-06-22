@@ -15,6 +15,7 @@ Usage:
   ccfind --backend Q          (internal) emit matching rows for query Q
   ccfind --preview F Q        (internal) render the preview pane
 """
+import glob
 import json
 import os
 import re
@@ -30,7 +31,9 @@ from datetime import datetime
 # $out/share/ccfind). Imports of ccfind_core happen lazily inside the
 # handlers that need them so users on older installs still get the search
 # UI even if the package is missing.
-_HERE = os.path.dirname(os.path.abspath(__file__))
+# realpath (not abspath) so a symlinked launcher (e.g. ~/.local/bin/ccfind ->
+# repo/ccfind) resolves to the real file's dir and still finds ccfind_core.
+_HERE = os.path.dirname(os.path.realpath(__file__))
 for _candidate in (_HERE, os.path.join(os.path.dirname(_HERE), "share", "ccfind")):
     if os.path.isdir(os.path.join(_candidate, "ccfind_core")) and _candidate not in sys.path:
         sys.path.insert(0, _candidate)
@@ -60,6 +63,8 @@ BADGES = {
 PROMPT_ALL = "search> "
 PROMPT_USER = "user> "
 
+# Default config dir, kept for back-compat. Real discovery goes through
+# claude_roots(), which also finds per-account config dirs (see below).
 CLAUDE_ROOT = os.path.join(HOME, ".claude", "projects")
 HERMES_ROOT = os.path.join(HOME, ".hermes")
 OPENCODE_DB = os.path.join(HOME, ".local", "share", "opencode", "opencode.db")
@@ -201,8 +206,51 @@ def raw_snippet(raw, q):
 # =====================
 # CLAUDE adapter
 # =====================
+def claude_roots():
+    """Every Claude Code `projects` dir to search.
+
+    Claude stores transcripts under its config dir (default ~/.claude). People
+    who run several accounts on one machine give each login its own config dir
+    via CLAUDE_CONFIG_DIR — typically ~/.claude, ~/.claude-work,
+    ~/.claude-personal, etc. Only one is ever 'active', so `claude --resume`
+    alone can't see the others. ccfind searches them ALL so a conversation is
+    findable (and resumable) no matter which account is currently selected.
+
+    Order: the active CLAUDE_CONFIG_DIR first, then the default ~/.claude, then
+    any sibling ~/.claude-* dirs. Duplicates (by realpath) are dropped."""
+    roots, seen = [], set()
+
+    def add(base):
+        if not base:
+            return
+        p = os.path.join(base, "projects")
+        rp = os.path.realpath(p)
+        if rp in seen or not os.path.isdir(p):
+            return
+        seen.add(rp)
+        roots.append(p)
+
+    add(os.environ.get("CLAUDE_CONFIG_DIR"))
+    add(os.path.join(HOME, ".claude"))
+    for d in sorted(glob.glob(os.path.join(HOME, ".claude-*"))):
+        add(d)
+    return roots
+
+
+def _claude_config_dir_for_path(path):
+    """Given a transcript path, return the config dir that owns it (the parent
+    of its `projects` dir) so we can point `claude --resume` at the right
+    account. Returns None if the path isn't under a recognizable layout."""
+    d = os.path.dirname(os.path.abspath(path))
+    while d and d != os.path.dirname(d):
+        if os.path.basename(d) == "projects":
+            return os.path.dirname(d)
+        d = os.path.dirname(d)
+    return None
+
+
 def claude_available():
-    return os.path.isdir(CLAUDE_ROOT)
+    return bool(claude_roots())
 
 
 def _claude_extract_text(entry):
@@ -288,10 +336,13 @@ def claude_find(query, user_only=False):
     if not claude_available():
         return []
     extract = _claude_extract_user_text if user_only else _claude_extract_text
+    roots = claude_roots()
+    if not roots:
+        return []
     try:
         out = subprocess.run(
             ["rg", "-l", "--no-ignore", "--hidden",
-             "--ignore-case", "-e", _sep_pattern(query), CLAUDE_ROOT],
+             "--ignore-case", "-e", _sep_pattern(query), *roots],
             capture_output=True, text=True, timeout=20)
         paths = [p for p in out.stdout.splitlines() if p.endswith(".jsonl")]
     except Exception:
@@ -345,13 +396,18 @@ def claude_find(query, user_only=False):
 def claude_resume_argv(row):
     sid = row["sid"]
     cwd = row.get("cwd")
+    path = row.get("row_path") or ""
     if row.get("is_sub"):
-        path = row.get("row_path") or ""
         proj_dir = os.path.dirname(os.path.dirname(os.path.dirname(path)))
         parent_file = os.path.join(proj_dir, sid + ".jsonl")
         pcwd = _claude_read_cwd(parent_file)
         if pcwd:
             cwd = pcwd
+    # Point `claude` at the account that owns this transcript, otherwise a
+    # resume from a non-active account fails with "conversation ID not found".
+    cfg = _claude_config_dir_for_path(path)
+    if cfg:
+        os.environ["CLAUDE_CONFIG_DIR"] = cfg
     return cwd, ["claude", "--resume", sid]
 
 
@@ -683,6 +739,10 @@ def preview(field1, query, user_only=False):
             match = next((r for r in rows if r["sid"] == sid), None)
         if match:
             print(BOLD + "Dir      " + RESET + abbrev(match.get("cwd") or "?"))
+            if source == "claude" and len(claude_roots()) > 1:
+                cfg = _claude_config_dir_for_path(match.get("row_path") or "")
+                if cfg:
+                    print(BOLD + "Account  " + RESET + os.path.basename(cfg))
             ts = match.get("ts")
             if ts:
                 pretty = fmt_ts(ts)
@@ -928,6 +988,9 @@ def launch(enabled=None, user_only=False):
             f"        at {result['path']}\n"
             f"        → resuming in {cwd}…\n"
         )
+        cfg = _claude_config_dir_for_path(result["path"])
+        if cfg:
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
         if cwd and os.path.isdir(cwd):
             os.chdir(cwd)
         try:
@@ -955,6 +1018,11 @@ def launch(enabled=None, user_only=False):
         new_sid, new_path = result
         sys.stderr.write(
             f"ccfind: created branch {new_sid} from {parent_sid} → resuming…\n")
+        # The branch is written beside its parent, so resume under the parent's
+        # account (config dir), not whichever one happens to be active.
+        cfg = _claude_config_dir_for_path(new_path)
+        if cfg:
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
         cwd = _claude_read_cwd(parent_path) or fallback_cwd
         if cwd and os.path.isdir(cwd):
             os.chdir(cwd)
@@ -1027,6 +1095,12 @@ def main():
         for n, s in SOURCES.items():
             ok = s["available"]()
             print(f"  {n}: {'AVAILABLE' if ok else 'not detected'}")
+            if n == "claude" and ok:
+                roots = claude_roots()
+                if len(roots) > 1:
+                    for r in roots:
+                        acct = os.path.basename(os.path.dirname(r))
+                        print(f"      account: {acct}  ({abbrev(r)})")
     else:
         sys.exit(__doc__)
 
