@@ -59,8 +59,10 @@ def main():
     print(f"  → Path: {out_path}")
     print(f"  → Resume CWD: {cwd}")
 
-    # Verify file is under the real Claude root
-    real_root = os.path.expanduser("~/.claude/projects")
+    # Verify file is under the active Claude root. The adapter honors
+    # CLAUDE_CONFIG_DIR (multi-account setups), so derive root the same way.
+    real_base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    real_root = os.path.join(real_base, "projects")
     assert out_path.startswith(real_root + os.sep), (
         f"output path not under {real_root}: {out_path}"
     )

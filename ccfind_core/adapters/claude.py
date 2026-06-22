@@ -39,7 +39,17 @@ from ..canonical import (
 # =====================================================================
 
 HOME = os.path.expanduser("~")
-CLAUDE_ROOT = os.path.join(HOME, ".claude", "projects")
+
+
+def _default_root() -> str:
+    """The active account's `projects` dir. Honors CLAUDE_CONFIG_DIR so that
+    multi-account setups read/write the same place `claude` itself uses."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+    return os.path.join(base, "projects")
+
+
+# Evaluated at import for back-compat; pass `root=` to override per call.
+CLAUDE_ROOT = _default_root()
 
 
 def slug_for_cwd(cwd: str) -> str:
