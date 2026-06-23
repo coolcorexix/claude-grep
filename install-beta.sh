@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-line installer for the ccfind BETA channel.
 #
-#   curl -fsSL https://raw.githubusercontent.com/coolcorexix/claude-grep/multi-account-support/install-beta.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/coolcorexix/claude-grep/main/install-beta.sh | bash
 #
 # Installs a `ccfind-beta` command alongside (not replacing) any existing
 # `ccfind`, so you can try in-progress features — multi-account search,
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 REPO="${CCFIND_BETA_REPO:-https://github.com/coolcorexix/claude-grep}"
-BRANCH="${CCFIND_BETA_BRANCH:-multi-account-support}"
+BRANCH="${CCFIND_BETA_BRANCH:-main}"
 DEST="${CCFIND_BETA_DIR:-$HOME/.local/share/ccfind-beta}"
 BIN="${CCFIND_BIN:-$HOME/.local/bin}"
 
