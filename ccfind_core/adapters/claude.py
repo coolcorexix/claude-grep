@@ -53,9 +53,14 @@ CLAUDE_ROOT = _default_root()
 
 
 def slug_for_cwd(cwd: str) -> str:
-    """Claude derives the project dir from cwd by replacing `/` with `-`.
-    Leading slash → leading dash. Mirrors what the CLI itself does."""
-    return cwd.replace("/", "-")
+    """Claude derives the project dir from cwd by replacing every
+    non-alphanumeric character with `-` (so `/`, `.`, `_`, spaces … all become
+    `-`). Verified against real transcripts: current Claude sanitizes
+    `~/Documents/x.nosync/y` → `-Users-…-x-nosync-y`. Older builds (≤2.1.0)
+    only replaced `/`, which is why a session created then can land in a folder
+    today's Claude won't resume from — matching this rule keeps writes
+    resumable."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
 
 
 def session_path(slug: str, session_id: str, root: Optional[str] = None) -> str:

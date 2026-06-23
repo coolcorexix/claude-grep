@@ -147,9 +147,18 @@ def abbrev(path):
 
 
 def _sep_pattern(q):
-    """Allow at most one non-alphanumeric char between each char of q.
-    Lets 'rSideProject' match 'r/SideProject', 'r-SideProject', etc."""
-    return "[^a-zA-Z0-9]?".join(re.escape(c) for c in q)
+    """Match the alphanumeric run of q with at most one non-alnum char between
+    each pair. Any non-alnum char IN q (space, slash, punctuation) becomes a
+    flexible separator slot — so 'crash loop' matches 'crash loop' /
+    'crash-loop' / 'crashloop', and 'rSideProject' matches 'r/SideProject'.
+
+    Emitting only alnum literals also keeps the pattern valid for ripgrep:
+    Python's re.escape(' ') is '\\ ', which Rust's regex engine rejects, so the
+    old per-char version made every multi-word query silently return nothing."""
+    chars = [c for c in q if c.isalnum()]
+    if not chars:
+        return r"\b\B"  # never matches (degenerate all-symbol query)
+    return "[^a-zA-Z0-9]?".join(re.escape(c) for c in chars)
 
 
 def highlight(text, q):
@@ -253,6 +262,81 @@ def claude_available():
     return bool(claude_roots())
 
 
+def _claude_live_path_uuids(path):
+    """The set of message uuids on the path Claude reconstructs when it resumes
+    this transcript — the lineage of the *newest tip* (the last appended
+    uuid-bearing line).
+
+    A Claude session is a tree, not a line: editing/re-sending a message (or two
+    terminals on one session) forks the `parentUuid` chain. `claude --resume`
+    only ever opens the newest tip, so messages NOT in this set live on
+    abandoned branches and are invisible after resume. Walks parentUuid over ALL
+    node types (system / compaction entries sit on the spine too)."""
+    parent = {}
+    last_uuid = None
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                u = d.get("uuid")
+                if not u:
+                    continue
+                parent[u] = d.get("parentUuid")
+                last_uuid = u
+    except OSError:
+        return set()
+    live = set()
+    cur = last_uuid
+    while cur is not None and cur in parent and cur not in live:
+        live.add(cur)
+        cur = parent[cur]
+    return live
+
+
+def classify_match(path, matched_uuid, _live_cache=None):
+    """Is `matched_uuid` on the branch Claude will resume to, or stranded on an
+    abandoned fork? Returns "live-path" | "stale-branch".
+
+    "stale-branch" means: your search hit a message that resume will NOT show —
+    you'd land on a different (newer) branch of the same session. Unknown ids
+    and chainless files fall back to "live-path" (don't cry wolf)."""
+    if matched_uuid is None:
+        return "live-path"
+    live = _live_cache if _live_cache is not None else _claude_live_path_uuids(path)
+    if not live:
+        return "live-path"
+    return "live-path" if matched_uuid in live else "stale-branch"
+
+
+def _claude_match_uuid(path, query):
+    """uuid of the first transcript message whose text contains `query`
+    (case-insensitive). Lets the resume path know which branch the hit is on."""
+    ql = query.lower()
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if not d.get("uuid"):
+                    continue
+                if ql in _claude_extract_text(d).lower():
+                    return d["uuid"]
+    except OSError:
+        pass
+    return None
+
+
 def _claude_extract_text(entry):
     parts = []
     msg = entry.get("message")
@@ -353,7 +437,7 @@ def claude_find(query, user_only=False):
     ql = query.lower()
     results = []
     for path in paths:
-        cwd = ts = snippet = raw_hit = None
+        cwd = ts = snippet = raw_hit = match_uuid = None
         try:
             with open(path, "r", errors="replace") as fh:
                 for line in fh:
@@ -375,6 +459,7 @@ def claude_find(query, user_only=False):
                             if s:
                                 snippet = s
                                 ts = entry.get("timestamp") or ts
+                                match_uuid = entry.get("uuid")  # where the hit is
                     if snippet and cwd:
                         break
         except Exception:
@@ -383,12 +468,17 @@ def claude_find(query, user_only=False):
         # so it would defeat the user-only filter — skip it in that mode.
         if snippet is None and raw_hit is not None and not user_only:
             snippet = raw_snippet(raw_hit, query)
+            try:
+                match_uuid = json.loads(raw_hit).get("uuid")
+            except Exception:
+                pass
         if snippet is None:
             continue
         sid, is_sub = claude_resumable(path)
         results.append({
             "source": "claude", "sid": sid, "is_sub": is_sub,
             "cwd": cwd, "ts": ts, "snippet": snippet, "row_path": path,
+            "match_uuid": match_uuid,
         })
     return results
 
@@ -650,20 +740,21 @@ SOURCES = {
 
 
 def _encode_field1(row):
-    # source|sid|is_sub|row_path  (row_path is last; may contain any chars)
-    return "{}|{}|{}|{}".format(
+    # source|sid|is_sub|match_uuid|row_path  (row_path is last; any chars.
+    # match_uuid is the message the search hit — empty if unknown.)
+    return "{}|{}|{}|{}|{}".format(
         row["source"], row["sid"], 1 if row.get("is_sub") else 0,
-        row.get("row_path") or "")
+        row.get("match_uuid") or "", row.get("row_path") or "")
 
 
 def _decode_field1(field1):
-    parts = field1.split("|", 3)
-    if len(parts) < 4:
+    parts = field1.split("|", 4)
+    if len(parts) < 5:
         return {"source": "claude", "sid": "", "is_sub": False,
-                "row_path": field1}
-    source, sid, is_sub_s, row_path = parts
-    return {"source": source, "sid": sid,
-            "is_sub": (is_sub_s == "1"), "row_path": row_path}
+                "match_uuid": "", "row_path": field1}
+    source, sid, is_sub_s, match_uuid, row_path = parts
+    return {"source": source, "sid": sid, "is_sub": (is_sub_s == "1"),
+            "match_uuid": match_uuid or None, "row_path": row_path}
 
 
 def _env_user_only():
@@ -751,8 +842,17 @@ def preview(field1, query, user_only=False):
             print()
             print(highlight(match.get("snippet", ""), query))
             print()
-            print(DIM + "tip: pressing Enter resumes the session at its LATEST state." + RESET)
-            print(DIM + "     if the session covered multiple topics, scroll up to the match time above." + RESET)
+            stale = (source == "claude" and match.get("match_uuid")
+                     and classify_match(match["row_path"], match["match_uuid"])
+                     == "stale-branch")
+            if stale:
+                print(YELLOW + "⑂ this match is on an older branch of the session "
+                      "(it diverged — e.g. an edited/re-sent message)." + RESET)
+                print(DIM + "  Enter forks at this match so you land here, not on "
+                      "the session's newer branch." + RESET)
+            else:
+                print(DIM + "tip: pressing Enter resumes the session at its LATEST state." + RESET)
+                print(DIM + "     if the session covered multiple topics, scroll up to the match time above." + RESET)
 
 
 def branch_claude_session(parent_path, parent_sid, checkpoint_uuid):
@@ -787,12 +887,36 @@ def branch_claude_session(parent_path, parent_sid, checkpoint_uuid):
     for e in copied:
         e["sessionId"] = new_sid
         e["forkedFrom"] = forked
-    new_path = os.path.join(os.path.dirname(parent_path), new_sid + ".jsonl")
+    new_path = _branch_target_path(parent_path, copied, new_sid)
+    os.makedirs(os.path.dirname(new_path), exist_ok=True)
     with open(new_path, "w") as fh:
         for e in copied:
             fh.write(json.dumps(e, ensure_ascii=False))
             fh.write("\n")
     return new_sid, new_path
+
+
+def _claude_slug_for_cwd(cwd):
+    """Mirror Claude's project-folder rule: every non-alphanumeric char → `-`.
+    (Verified against real transcripts; see adapters/claude.slug_for_cwd.)"""
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+
+
+def _branch_target_path(parent_path, copied_entries, new_sid):
+    """Where to write a branched transcript so `claude --resume` can find it.
+
+    Must NOT just sit next to the parent: an old parent may live in a stale slug
+    folder (e.g. `.nosync` kept as a dot) that today's Claude won't derive from
+    the cwd. Instead write into `<config-dir>/projects/<slug(cwd)>/`, using the
+    parent's owning config dir and Claude's current slug rule. Falls back to the
+    parent's folder if cwd/config can't be determined."""
+    cwd = next((e.get("cwd") for e in copied_entries
+                if isinstance(e.get("cwd"), str) and e.get("cwd")), None)
+    cfg = _claude_config_dir_for_path(parent_path)
+    if cwd and cfg:
+        return os.path.join(cfg, "projects", _claude_slug_for_cwd(cwd),
+                            new_sid + ".jsonl")
+    return os.path.join(os.path.dirname(parent_path), new_sid + ".jsonl")
 
 
 def branch_flow_claude(parent_path, parent_sid):
@@ -1032,7 +1156,37 @@ def launch(enabled=None, user_only=False):
             sys.exit("ccfind: command not found: claude")
         return
 
-    # Normal Enter → resume
+    # Normal Enter → resume.
+    # If the matched message lives on an ABANDONED branch of a diverged session
+    # (edit/resend/two-terminals), `claude --resume <sid>` would open the
+    # session's newest tip instead — i.e. a different conversation than the one
+    # you searched for. Detect that and fork at the matched message so you land
+    # exactly where your hit was. Only applies to claude, non-sub-agent rows.
+    if (source == "claude" and not info["is_sub"] and info.get("match_uuid")
+            and classify_match(info["row_path"], info["match_uuid"]) == "stale-branch"):
+        try:
+            new_sid, new_path = branch_claude_session(
+                info["row_path"], info["sid"], info["match_uuid"])
+        except Exception as e:
+            sys.stderr.write(f"ccfind: could not branch at match ({e}); "
+                             "resuming session's latest state instead\n")
+        else:
+            sys.stderr.write(
+                f"ccfind: your match was on an older branch of {info['sid'][:8]} "
+                f"(resuming it directly would open a different, newer thread).\n"
+                f"        forked at the match → {new_sid[:8]}; resuming that.\n")
+            cfg = _claude_config_dir_for_path(new_path)
+            if cfg:
+                os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            cwd = _claude_read_cwd(info["row_path"]) or fallback_cwd
+            if cwd and os.path.isdir(cwd):
+                os.chdir(cwd)
+            try:
+                os.execvp("claude", ["claude", "--resume", new_sid])
+            except FileNotFoundError:
+                sys.exit("ccfind: command not found: claude")
+            return
+
     row = {
         "source": source, "sid": info["sid"],
         "is_sub": info["is_sub"], "row_path": info["row_path"],
