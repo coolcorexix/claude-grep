@@ -1,0 +1,49 @@
+{
+  "expo": {
+    "name": "Yum Quest",
+    "slug": "food-diary-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "yumquest",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#FFF7ED"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Yum Quest uses the camera to take a photo of the food your child unlocked today.",
+        "NSPhotoLibraryUsageDescription": "Yum Quest lets you pick a food photo from your library to add to the diary."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#FFF7ED",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Yum Quest uses the camera to take a photo of the food your child unlocked today."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Yum Quest lets you pick a food photo from your library to add to the diary."
+        }
+      ]
+    ]
+  }
+}
