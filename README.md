@@ -83,15 +83,18 @@ ccfind --source claude,hermes  # or a subset
 ccfind --user-only             # match only what YOU typed (alias -u; Ctrl-U in the UI)
 ```
 
-### Port a session into Claude Code (`Ctrl-X`)
+### Port a session across agents (`Ctrl-X`)
 
-Press **`Ctrl-X`** on any **`[o]` OpenCode** or **`[h]` Hermes** row to **convert that session into a fresh, resumable Claude Code transcript** and jump straight into it. Under the hood `ccfind` reads the source (OpenCode SQLite or Hermes JSONL/JSON) through the canonical conversation IR (see below), writes a new JSONL under `~/.claude/projects/<slug>/<new-sid>.jsonl` with `forkedFrom` provenance pointing at the source, then `exec`s `claude --resume`.
+Press **`Ctrl-X`** on any row to **port that session into the other agent** and jump straight into it:
 
-Tool calls, reasoning/thinking, text content, and inline images all carry over. For OpenCode, per-message provider details (model, cost, tokens) are preserved in metadata. For Hermes, OpenAI-style `tool_calls` are converted to Anthropic-style `tool_use` + `tool_result` blocks per Claude's convention.
+- **`[o]` OpenCode or `[h]` Hermes** → ports into **Claude Code** (reads the source, writes a fresh resumable JSONL under `~/.claude/projects/<slug>/<new-sid>.jsonl`, then `exec`s `claude --resume`).
+- **`[c]` Claude** → ports into **OpenCode** (reads the JSONL, writes a new session into `~/.local/share/opencode/opencode.db`, then `exec`s `opencode --session <id>`).
 
-CWD selection: OpenCode sessions carry their own working directory and resume there. Hermes sessions don't, so the new Claude session opens in `ccfind`'s current directory (where you launched the search).
+Both directions carry over tool calls, reasoning/thinking, text content, and inline images. The `forkedFrom` provenance in metadata always points back to the source session.
 
-> Directions today: **OpenCode → Claude**, **Hermes → Claude**. Claude → OpenCode and Claude → Hermes are on the roadmap (both targets track per-session economics fields or runtime-specific metadata that Claude transcripts don't carry, so the writers need to synthesize them).
+CWD selection: OpenCode sessions carry their own working directory and resume there. Claude sessions also carry their cwd. Hermes sessions don't, so ports from Hermes resume in `ccfind`'s current directory.
+
+> Supported directions: **OpenCode ↔ Claude**, **Hermes → Claude**.
 
 ## Branch any session at any message (prompt tree)
 

@@ -210,6 +210,63 @@ def test_claude_find_end_to_end(monkeypatch_env=None):
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_backend_hides_current_session():
+    """Running ccfind from inside a Claude session must not surface that very
+    session: the query lives in its transcript (you typed it) and, being newest,
+    would rank first — resuming it just drops you back where you are."""
+    if not shutil.which("rg"):
+        print("SKIP: ripgrep not installed")
+        return
+    import io
+    home = tempfile.mkdtemp()
+    old_home = mod.HOME
+    old_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    old_sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    old_stdout = sys.stdout
+    try:
+        mod.HOME = home
+        cfg = os.path.join(home, ".claude")
+        os.environ["CLAUDE_CONFIG_DIR"] = cfg
+        projects = os.path.join(cfg, "projects")
+        # "current" session — newest, so it would otherwise rank first
+        _write_session(projects, "-tmp-proj", "sid-current", [
+            {"type": "user", "cwd": "/tmp/proj", "timestamp": "2026-06-02T00:00:00Z",
+             "message": {"role": "user", "content": "find me ZORKMID please"}},
+        ])
+        # an older, genuinely relevant session
+        _write_session(projects, "-tmp-proj", "sid-other", [
+            {"type": "user", "cwd": "/tmp/proj", "timestamp": "2026-06-01T00:00:00Z",
+             "message": {"role": "user", "content": "the ZORKMID ticket is here"}},
+        ])
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-current"
+        sys.stdout = io.StringIO()
+        mod.backend("ZORKMID", user_only=True)
+        out = sys.stdout.getvalue()
+        sys.stdout = old_stdout
+        assert "sid-other" in out, out
+        assert "sid-current" not in out, out
+
+        # standalone (no CLAUDE_CODE_SESSION_ID) hides nothing
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        sys.stdout = io.StringIO()
+        mod.backend("ZORKMID", user_only=True)
+        out = sys.stdout.getvalue()
+        sys.stdout = old_stdout
+        assert "sid-current" in out and "sid-other" in out, out
+    finally:
+        sys.stdout = old_stdout
+        mod.HOME = old_home
+        if old_cfg is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = old_cfg
+        if old_sid is None:
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        else:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = old_sid
+        shutil.rmtree(home, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------
 # branch / fork creation
 # --------------------------------------------------------------------------

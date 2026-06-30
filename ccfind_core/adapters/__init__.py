@@ -26,7 +26,7 @@ _REGISTRY: Dict[str, Dict[str, Optional[Callable]]] = {
     },
     "opencode": {
         "read": getattr(opencode, "read_session", None),
-        "write": None,  # write deferred; expose as not capable
+        "write": getattr(opencode, "write_session", None),
         "list": getattr(opencode, "list_sessions", None),
     },
     "hermes": {

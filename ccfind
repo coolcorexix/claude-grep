@@ -777,9 +777,15 @@ def backend(query, enabled=None, user_only=False):
         except Exception:
             continue
     all_rows.sort(key=lambda r: ts_key(r.get("ts")), reverse=True)
+    # When ccfind runs from inside a Claude session, that session inherits the
+    # query in its own transcript (you typed it) and, being the newest, would
+    # rank first — resuming it just drops you back where you are. Hide it.
+    own_sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
     seen = set()
     emitted = 0
     for r in all_rows:
+        if own_sid and r["source"] == "claude" and r["sid"] == own_sid:
+            continue
         key = (r["source"], r["sid"])
         if key in seen:
             continue
@@ -1053,31 +1059,40 @@ def launch(enabled=None, user_only=False):
     if source not in SOURCES:
         sys.exit(f"ccfind: unknown source {source!r}")
 
-    # Ctrl-X → port a non-Claude session into Claude Code. Reads the source
-    # via ccfind_core's canonical IR, writes a fresh resumable Claude
-    # transcript, then resumes it. Supports opencode and hermes today.
+    # Ctrl-X → port a session into the other agent. Claude rows port to
+    # OpenCode; OpenCode/Hermes rows port to Claude Code. Reads the source
+    # via ccfind_core's canonical IR, writes a fresh resumable target
+    # transcript, then resumes it.
     if pressed_key == "ctrl-x":
-        if source == "claude":
-            sys.exit("ccfind: ctrl-x ports INTO Claude — selected row is "
-                     "already Claude. Use Enter to resume in place.")
-        if source not in ("opencode", "hermes"):
-            sys.exit(f"ccfind: ctrl-x not supported for {source!r}")
         try:
             from ccfind_core import adapters as _cc_adapters
         except ImportError as e:
             sys.exit(f"ccfind: ctrl-x needs the ccfind_core package "
                      f"(import failed: {e}). Reinstall ccfind.")
+        sid = info["sid"]
+
+        # Determine target direction
+        if source == "claude":
+            target = "opencode"
+            if not opencode_available():
+                sys.exit("ccfind: OpenCode DB not found; cannot port to OpenCode")
+        elif source in ("opencode", "hermes"):
+            target = "claude"
+        else:
+            sys.exit(f"ccfind: ctrl-x not supported for {source!r}")
+
         if not _cc_adapters.can(source, "read"):
             sys.exit(f"ccfind: ccfind_core has no reader for {source!r}")
+        if not _cc_adapters.can(target, "write"):
+            sys.exit(f"ccfind: ccfind_core has no writer for {target!r}")
 
-        sid = info["sid"]
         sys.stderr.write(
-            f"ccfind: porting {source} session {sid} → Claude Code…\n")
+            f"ccfind: porting {source} session {sid} → {target.title()} Code…\n")
 
         read_kwargs = {}
-        # Hermes adapter benefits from a direct path (skips filesystem
-        # search). info["row_path"] for hermes is the .jsonl/.json path.
         if source == "hermes" and info.get("row_path"):
+            read_kwargs["path"] = info["row_path"]
+        if source == "claude" and info.get("row_path"):
             read_kwargs["path"] = info["row_path"]
 
         try:
@@ -1085,15 +1100,11 @@ def launch(enabled=None, user_only=False):
         except Exception as e:
             sys.exit(f"ccfind: failed to read {source} session: {e}")
 
-        # Provenance: stamp origin so the new transcript cites its source.
         conv.metadata.setdefault("forkedFrom", {
             "source_agent": source,
             "source_session_id": sid,
         })
 
-        # Pick a cwd for the new Claude session. OpenCode carries one;
-        # Hermes doesn't, so fall back to the search row's hint and then
-        # to the user's current dir.
         port_cwd = conv.cwd or fallback_cwd
         if port_cwd and (port_cwd.startswith("profile:") or not os.path.isdir(port_cwd)):
             port_cwd = os.getcwd()
@@ -1101,26 +1112,35 @@ def launch(enabled=None, user_only=False):
             port_cwd = os.getcwd()
 
         try:
-            result = _cc_adapters.write("claude", conv, cwd=port_cwd)
+            result = _cc_adapters.write(target, conv, cwd=port_cwd)
         except Exception as e:
-            sys.exit(f"ccfind: failed to write Claude transcript: {e}")
+            sys.exit(f"ccfind: failed to write {target} transcript: {e}")
         new_sid = result["session_id"]
-        cwd = result["cwd"]
+        out_cwd = result["cwd"]
         sys.stderr.write(
-            f"ccfind: created Claude session {new_sid}\n"
+            f"ccfind: created {target} session {new_sid}\n"
             f"        from {source}://{sid}\n"
             f"        at {result['path']}\n"
-            f"        → resuming in {cwd}…\n"
+            f"        → resuming in {out_cwd}…\n"
         )
-        cfg = _claude_config_dir_for_path(result["path"])
-        if cfg:
-            os.environ["CLAUDE_CONFIG_DIR"] = cfg
-        if cwd and os.path.isdir(cwd):
-            os.chdir(cwd)
-        try:
-            os.execvp("claude", ["claude", "--resume", new_sid])
-        except FileNotFoundError:
-            sys.exit("ccfind: command not found: claude")
+
+        if target == "claude":
+            cfg = _claude_config_dir_for_path(result["path"])
+            if cfg:
+                os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            if out_cwd and os.path.isdir(out_cwd):
+                os.chdir(out_cwd)
+            try:
+                os.execvp("claude", ["claude", "--resume", new_sid])
+            except FileNotFoundError:
+                sys.exit("ccfind: command not found: claude")
+        else:
+            if out_cwd and os.path.isdir(out_cwd):
+                os.chdir(out_cwd)
+            try:
+                os.execvp("opencode", ["opencode", "--session", new_sid])
+            except FileNotFoundError:
+                sys.exit("ccfind: command not found: opencode")
         return
 
     # Ctrl-B → branch (fork the session from a chosen user message)
