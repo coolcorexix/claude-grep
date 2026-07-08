@@ -201,6 +201,17 @@ def first_text_match(text, q):
     return snippet_around(text, q, m.start())
 
 
+def first_text(text, limit=CTX_BEFORE + CTX_AFTER):
+    """Snippet for the no-query 'recent conversations' listing: just the
+    start of the text, no match to center on."""
+    if not text:
+        return None
+    s = re.sub(r"\s+", " ", text).strip()
+    if not s:
+        return None
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
 def raw_snippet(raw, q):
     m = re.search(_sep_pattern(q), raw, re.IGNORECASE)
     if not m:
@@ -423,14 +434,23 @@ def claude_find(query, user_only=False):
     roots = claude_roots()
     if not roots:
         return []
-    try:
-        out = subprocess.run(
-            ["rg", "-l", "--no-ignore", "--hidden",
-             "--ignore-case", "-e", _sep_pattern(query), *roots],
-            capture_output=True, text=True, timeout=20)
-        paths = [p for p in out.stdout.splitlines() if p.endswith(".jsonl")]
-    except Exception:
-        return []
+    # Empty query: no filter, just list what's there (used for the default
+    # "recent conversations" view before the user types anything).
+    listing = not query
+    if listing:
+        paths = []
+        for root in roots:
+            paths.extend(glob.glob(os.path.join(root, "**", "*.jsonl"),
+                                    recursive=True))
+    else:
+        try:
+            out = subprocess.run(
+                ["rg", "-l", "--no-ignore", "--hidden",
+                 "--ignore-case", "-e", _sep_pattern(query), *roots],
+                capture_output=True, text=True, timeout=20)
+            paths = [p for p in out.stdout.splitlines() if p.endswith(".jsonl")]
+        except Exception:
+            return []
     paths.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
                reverse=True)
     paths = paths[:MAX_FILES]
@@ -444,7 +464,7 @@ def claude_find(query, user_only=False):
                     line = line.rstrip("\n")
                     if not line:
                         continue
-                    if raw_hit is None and ql in line.lower():
+                    if not listing and raw_hit is None and ql in line.lower():
                         raw_hit = line
                     try:
                         entry = json.loads(line)
@@ -455,7 +475,7 @@ def claude_find(query, user_only=False):
                     if snippet is None:
                         txt = extract(entry)
                         if txt:
-                            s = first_text_match(txt, query)
+                            s = first_text(txt) if listing else first_text_match(txt, query)
                             if s:
                                 snippet = s
                                 ts = entry.get("timestamp") or ts
@@ -474,6 +494,8 @@ def claude_find(query, user_only=False):
                 pass
         if snippet is None:
             continue
+        if ts is None:
+            ts = os.path.getmtime(path) if os.path.exists(path) else None
         sid, is_sub = claude_resumable(path)
         results.append({
             "source": "claude", "sid": sid, "is_sub": is_sub,
@@ -545,16 +567,21 @@ def _hermes_text_from_json(d, user_only=False):
 def hermes_find(query, user_only=False):
     if not hermes_available():
         return []
-    try:
-        out = subprocess.run(
-            ["rg", "-l", "--no-ignore", "--hidden",
-             "--ignore-case", "--glob", "*.json", "--glob", "*.jsonl",
-             "-e", _sep_pattern(query), HERMES_ROOT],
-            capture_output=True, text=True, timeout=20)
-        paths = [p for p in out.stdout.splitlines()
-                 if p.endswith((".json", ".jsonl"))]
-    except Exception:
-        return []
+    listing = not query
+    if listing:
+        paths = (glob.glob(os.path.join(HERMES_ROOT, "**", "*.json"), recursive=True) +
+                 glob.glob(os.path.join(HERMES_ROOT, "**", "*.jsonl"), recursive=True))
+    else:
+        try:
+            out = subprocess.run(
+                ["rg", "-l", "--no-ignore", "--hidden",
+                 "--ignore-case", "--glob", "*.json", "--glob", "*.jsonl",
+                 "-e", _sep_pattern(query), HERMES_ROOT],
+                capture_output=True, text=True, timeout=20)
+            paths = [p for p in out.stdout.splitlines()
+                     if p.endswith((".json", ".jsonl"))]
+        except Exception:
+            return []
     paths = [p for p in paths if "/sessions/" in p or p.endswith("/sessions.json")]
     paths.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
                reverse=True)
@@ -583,7 +610,8 @@ def hermes_find(query, user_only=False):
                             for b in c:
                                 if isinstance(b, dict) and isinstance(b.get("text"), str):
                                     texts.append(b["text"])
-                snippet = first_text_match("\n".join(texts), query)
+                joined = "\n".join(texts)
+                snippet = first_text(joined) if listing else first_text_match(joined, query)
             else:
                 with open(path, "r", errors="replace") as fh:
                     try:
@@ -594,11 +622,11 @@ def hermes_find(query, user_only=False):
                     if d.get("session_id"):
                         sid = d["session_id"]
                     ts = d.get("last_updated") or d.get("session_start")
-                    snippet = first_text_match(
-                        _hermes_text_from_json(d, user_only), query)
+                    text = _hermes_text_from_json(d, user_only)
+                    snippet = first_text(text) if listing else first_text_match(text, query)
         except Exception:
             continue
-        if snippet is None and not user_only:
+        if snippet is None and not user_only and not listing:
             try:
                 with open(path, "r", errors="replace") as fh:
                     snippet = raw_snippet(fh.read(), query)
@@ -606,6 +634,8 @@ def hermes_find(query, user_only=False):
                 snippet = None
         if snippet is None:
             continue
+        if ts is None:
+            ts = os.path.getmtime(path) if os.path.exists(path) else None
         cwd_hint = None
         m = re.search(r"/profiles/([^/]+)/", path)
         if m:
@@ -700,13 +730,17 @@ def opencode_find(query, user_only=False):
             pass
     seen = set()
     results = []
+    listing = not query
     for r in rows_out:
         sid = r["sid"]
         if sid in seen:
             continue
-        snippet = first_text_match(_opencode_text(r["pdata"]), query)
-        if snippet is None:
-            snippet = raw_snippet(r["pdata"], query)
+        if listing:
+            snippet = first_text(r["title"]) or first_text(_opencode_text(r["pdata"]))
+        else:
+            snippet = first_text_match(_opencode_text(r["pdata"]), query)
+            if snippet is None:
+                snippet = raw_snippet(r["pdata"], query)
         if snippet is None:
             continue
         seen.add(sid)
@@ -764,8 +798,15 @@ def _env_user_only():
 
 
 def backend(query, enabled=None, user_only=False):
-    if len(query.strip()) < 2:
-        return
+    stripped = query.strip()
+    if stripped:
+        if len(stripped) < 2:
+            return
+    else:
+        # No text typed yet: fall through to each source's listing mode
+        # (empty query), which shows recent conversations sorted by last
+        # updated instead of nothing.
+        query = ""
     all_rows = []
     for name, src in SOURCES.items():
         if enabled and name not in enabled:
@@ -1035,7 +1076,7 @@ def launch(enabled=None, user_only=False):
     ]
     if _fzf_version() >= (0, 62):
         cmd += ["--ghost",
-                "type a phrase from any past session (2+ chars) — "
+                "showing recent sessions — type a phrase to search (2+ chars) — "
                 "Ctrl-U to match only what you typed"]
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
